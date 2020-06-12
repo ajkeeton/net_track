@@ -33,6 +33,21 @@ void bgh_config_init(bgh_config_t *config) {
     config->scale_down_pct = BGH_DEFAULT_HASH_FULL_PCT * 0.1;
 }
 
+void bgh_randomize_refreshes(bgh_t *b, float pct) {
+    int32_t offset = pct / 100.0 * b->config.refresh_period;
+
+    if(pct <= 0)
+        return;
+
+    if(!offset)
+        offset = 3; // This will randomize us +/- 1
+
+    b->config.refresh_period += rand() % offset - offset / 2;
+    if(b->config.refresh_period <= 0) {
+        b->config.refresh_period = 1;
+    }
+}
+
 bgh_row_t *bgh_new_row() {
     bgh_row_t *row = (bgh_row_t*)calloc(sizeof(bgh_row_t), 1);
     if(!row)
@@ -107,6 +122,18 @@ uint64_t _update_size(bgh_config_t *config, int *idx, bgh_tbl_t *tbl) {
     return tbl->num_rows;
 }
 
+static inline void _clear_table(bgh_tbl_t *tbl) {
+    for(int i=0; i<tbl->num_rows; i++) {
+        if(tbl->rows[i]->data) {
+            tbl->free_cb(tbl->rows[i]->data);
+            tbl->rows[i]->data = NULL;
+            tbl->rows[i]->deleted = false;
+        }
+    }
+
+    tbl->inserted = tbl->collisions = 0;
+}
+
 static void *refresh_thread(void *ctx) {
     bgh_t *ssns = (bgh_t*)ctx;
     static time_t last = 0;
@@ -126,15 +153,23 @@ static void *refresh_thread(void *ctx) {
 
         // Calc new hash size
         uint64_t nrows = _update_size(&ssns->config, &pindex, ssns->active);
-        uint64_t max_inserts = nrows * ssns->config.hash_full_pct/100.0;
 
-        // Create new hash
-        ssns->standby = bgh_new_tbl(nrows, max_inserts, ssns->active->free_cb);
+        if(ssns->standby && nrows == ssns->standby->num_rows)
+            // Just re-use this table
+            _clear_table(ssns->standby);
+        else {
+            // Delete old table
+            if(ssns->standby) bgh_free_table(ssns->standby);
+
+            uint64_t max_inserts = nrows * ssns->config.hash_full_pct/100.0;
+            // Create new hash
+            ssns->standby = bgh_new_tbl(nrows, max_inserts, ssns->active->free_cb);
+        }
 
         if(!ssns->standby) {
             // XXX Need way to handle/report this case gracefully
-            // For now, just skip resize + timneout :/
-            // abort();
+            // For now, just clear the active table
+            _clear_table(ssns->active);
             continue;
         }
 
@@ -146,7 +181,7 @@ static void *refresh_thread(void *ctx) {
         // the data is removed from that table and inserted in the standby table
         sleep(ssns->config.timeout);
 
-        bgh_tbl_t *old_tbl = ssns->active;
+        bgh_tbl_t *old = ssns->active;
 
         // Swap to the new table
         pthread_mutex_lock(&ssns->lock);
@@ -154,11 +189,7 @@ static void *refresh_thread(void *ctx) {
         ssns->refreshing = false;
         pthread_mutex_unlock(&ssns->lock);
 
-        // Not technically necessary, but makes debugging easier
-        ssns->standby = NULL;
-
-        // Delete old table
-        bgh_free_table(old_tbl);
+        ssns->standby = old;
 
         last = now;
     }
@@ -217,7 +248,8 @@ static inline int key_eq(bgh_key_t *k1, bgh_key_t *k2) {
 
 // Hash func: XOR32
 // Reference: https://www.researchgate.net/publication/281571413_COMPARISON_OF_HASH_STRATEGIES_FOR_FLOW-BASED_LOAD_BALANCING
-static inline uint64_t hash_func(uint64_t mask, bgh_key_t *key) {
+//static inline uint64_t hash_func(uint64_t mask, bgh_key_t *key) {
+uint64_t hash_func(uint64_t mask, bgh_key_t *key) {
 #if 1
     uint64_t h = (uint64_t)(key->sip ^ key->dip) ^
                   (uint64_t)(key->sport * key->dport);
@@ -320,6 +352,7 @@ bgh_row_t *_lookup_row(bgh_tbl_t *table, bgh_key_t *key) {
 
     return NULL;
 }
+
 bgh_stat_t bgh_insert_table(bgh_tbl_t *tbl, bgh_key_t *key, void *data) {
     // XXX Handle this case better ...
     // - should allow overwrites
@@ -364,7 +397,8 @@ bgh_stat_t bgh_insert(bgh_t *ssns, bgh_key_t *key, void *data) {
 
 static inline void _move_tables(
         bgh_tbl_t *active, bgh_tbl_t *standby, bgh_key_t *key, bgh_row_t *row) {
-    bgh_insert_table(standby, key, row->data);
+    if(bgh_insert_table(standby, key, row->data) != BGH_OK)
+        return; // this makes sure it still gets deleted correctly
     active->inserted--;
     row->data = NULL;
     row->deleted = true; // this is necessary to handle the case where there 
@@ -407,10 +441,12 @@ void *bgh_lookup(bgh_t *ssns, bgh_key_t *key) {
 
     pthread_mutex_lock(&ssns->lock);
     if(ssns->refreshing) {
-        if(ssns->active->inserted > ssns->standby->inserted)
+        if(ssns->active->inserted > ssns->standby->inserted) {
             data = _draining_lookup_active(ssns->active, ssns->standby, key);
-        else 
+        }
+        else {
             data = _draining_prefer_standby(ssns->active, ssns->standby, key);
+        }
         pthread_mutex_unlock(&ssns->lock);
 
         return data;

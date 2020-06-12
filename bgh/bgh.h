@@ -122,6 +122,14 @@ void bgh_clear(bgh_t *tracker, bgh_key_t *key);
 // Populate given stats structure
 void bgh_get_stats(bgh_t *tracker, bgh_stats_t *stats);
 
+// Apply a random offset to the refresh and refresh timeout 
+// This prevents timing attacks and helps performance when BGH is used in a 
+// large number of parallel threads
+//
+// Argument is a percentage applied to the current settings.
+// Can be called repeatedly to re-randomize the the settings
+void bgh_randomize_refreshes(bgh_t *tracker, float pct);
+
 #ifdef __cplusplus
 }
 #endif

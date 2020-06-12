@@ -19,14 +19,17 @@ void *_draining_prefer_standby(
 bgh_stat_t bgh_insert_table(bgh_tbl_t *tbl, bgh_key_t *key, void *data);
 int64_t _lookup_idx(bgh_tbl_t *table, bgh_key_t *key);
 bgh_tbl_t 
-    *bgh_new_tbl(uint64_t rows, uint64_t max_inserts, void (*free_cb)(void *));
-
+*bgh_new_tbl(uint64_t rows, uint64_t max_inserts, void (*free_cb)(void *));
+void bgh_free_table(bgh_tbl_t *tbl);
 int prime_total();
 uint64_t prime_at_idx(int idx);
 int prime_nearest_idx(uint64_t val);
 uint64_t prime_larger_idx(int idx);
 uint64_t prime_smaller_idx(int idx);
+bgh_row_t *_lookup_row(bgh_tbl_t *table, bgh_key_t *key);
+uint64_t hash_func(uint64_t mask, bgh_key_t *key);
 }
+
 void free_cb(void *p) {
     free(p);
 }
@@ -213,7 +216,6 @@ void timeouts() {
     assert_eq(bgh_lookup(tracker, &key), "bar");
 
     assert(!tracker->refreshing);
-    assert(!tracker->standby);
     assert(tracker->active->inserted == 2);
     assert(tracker->active->collisions == 0);
 
@@ -558,18 +560,22 @@ static int64_t inline nanos_total(struct timespec *start) {
     return (uint64_t)ret.tv_sec * 1000000000L + ret.tv_nsec;
 }
 
+#define INIT_NUM_ROWS 600101
+#define NUM_KEYS 1024*512
+#define TEST_LENGTH 60*5
+
 void stress() {
     puts("Starting long-running stress test");
 
     bgh_config_t conf;
     bgh_config_init(&conf);
-    conf.starting_rows = 3000017;
+    conf.starting_rows = INIT_NUM_ROWS;
     conf.timeout = 4;
-    conf.refresh_period = 8;
+    conf.refresh_period = 12;
 
     bgh_t *tracker = bgh_config_new(&conf, free_cb);
 
-    for(int i=0; i<1024*512; i++) {
+    for(int i=0; i<NUM_KEYS; i++) {
         keys.push_back(gen_rand_key());
     }
 
@@ -597,7 +603,7 @@ void stress() {
             bgh_stats_t stats;
             bgh_get_stats(tracker, &stats);
             // print stats
-            printf("\n%lus, iteration %llu, - Simulating %d sessions\n",
+            printf("\n%lus, iteration %llu. Simulating %d sessions\n",
                     time(NULL) - start, iteration, sessions_max);
             printf("- inserted:       %llu\n", stats.inserted);
             printf("- collisions:     %llu\n", stats.collisions);
@@ -606,25 +612,30 @@ void stress() {
             printf("- failed inserts: %llu\n", failed_insert);
             printf("- %% used:         %.1f\n", (float)stats.inserted / stats.num_rows * 100);
             printf("- Lookup time avg: %llu ns\n", lookup_total_time/lookup_count);
-            printf("- Insert time avg: %llu ns\n", insert_total_time/insert_count);
+            if(!insert_count)
+                puts("- No successful inserts");
+            else
+                printf("- Insert time avg: %llu ns\n", insert_total_time/insert_count);
 
             failed_insert = 0;
             lookup_total_time = lookup_count = 0,
             insert_total_time = insert_count  = 0;
+
+            bgh_randomize_refreshes(tracker, 5);
         }
 
         if(now - last_state_change > 30) {
             sessions_max = rand() % keys.size();
-            if(sessions_max < 100)
-                sessions_max = 100;
+            if(sessions_max < NUM_KEYS)
+                sessions_max = NUM_KEYS;
             last_state_change = now;
         }
 
-        if(now - start > 60*5)
+        if(now - start > TEST_LENGTH)
             break;
 
         // New session
-        if(!(rand() % 10)) {
+        if(!(rand() % 10) || !insert_count) {
             key = get_rand_key();
             void *d = strdup("data");
 
@@ -632,7 +643,7 @@ void stress() {
             if(bgh_insert(tracker, &key, d) != BGH_OK) {
                 failed_insert++;
                 free(d);
-            } 
+            }
             else {
                 insert_total_time += nanos_total(&tstart);
                 insert_count++;
@@ -666,6 +677,132 @@ void stress() {
     bgh_free(tracker);
 }
 
+bgh_key_t find_collision(bgh_key_t src, uint64_t mask) {
+    bgh_key_t key;
+    memcpy(&key, &src, sizeof(key));
+    uint64_t *first_8 = (uint64_t*)&key;
+    uint64_t h = hash_func(mask, &src);
+
+    do {
+        *first_8 += 1;
+    } while(h != hash_func(mask, &key));
+
+    assert(hash_func(mask, &key) == h);
+
+    return key;
+}
+
+void swapping() {
+    bgh_config_t conf;
+    bgh_config_init(&conf);
+    conf.starting_rows = 43;
+
+    bgh_t *tracker = bgh_config_new(&conf, free_cb);
+
+    tracker->active->max_inserts = conf.starting_rows;
+    // Make the thread exit
+    tracker->running = false;
+
+    bgh_key_t key;
+    memset(&key, 0, sizeof(key));
+    key.sip = 10;
+
+    void *d = strdup("data");
+    assert(bgh_insert(tracker, &key, d) == BGH_OK);
+
+    key.sip = 20;
+    d = strdup("data 2");
+    assert(bgh_insert(tracker, &key, d) == BGH_OK);
+
+    key.sip = 30;
+    d = strdup("data 3");
+    assert(bgh_insert(tracker, &key, d) == BGH_OK);
+
+    key.sip = 40;
+    d = strdup("data 4");
+    assert(bgh_insert(tracker, &key, d) == BGH_OK);
+
+    // Force a collision
+    bgh_key_t key2 = find_collision(key, conf.starting_rows);
+    // Make sure we have a colliding row with a different key
+    assert(memcmp(&key, &key2, sizeof(key)));
+    d = strdup("data 4.5");
+    assert(bgh_insert(tracker, &key2, d) == BGH_OK);
+
+    bgh_tbl_t *active = tracker->active;
+
+    tracker->standby = bgh_new_tbl(conf.starting_rows, 4, free_cb);
+    tracker->standby->max_inserts = conf.starting_rows;
+    bgh_tbl_t *standby = tracker->standby;
+
+    // Sanity - after the first insert, key is in active table only
+    key.sip = 10;
+    bgh_row_t *row = _lookup_row(active, &key);
+    assert_eq(row->data, "data");
+    row = _lookup_row(standby, &key);
+    assert(!row->data);
+
+    tracker->refreshing = true;
+
+    // We're refreshing, so lookups on 'active' should cause the row to 'move'
+    // to the standby table
+    assert_eq(_draining_lookup_active(active, standby, &key), "data");
+
+    // Make sure no longer in 'active'
+    row = _lookup_row(active, &key);
+    assert(!row->data);
+    row = _lookup_row(standby, &key);
+    assert_eq(row->data, "data");
+
+    key.sip = 20;
+    // Make sure in active
+    row = _lookup_row(active, &key);
+    assert_eq(row->data, "data 2");
+    // Moves row
+    assert_eq(_draining_prefer_standby(active, standby, &key), "data 2");
+    // Make sure no longer in 'active'
+    row = _lookup_row(active, &key);
+    assert(!row->data);
+    row = _lookup_row(standby, &key);
+    assert_eq(row->data, "data 2");
+
+    // We've moved. Make sure we're still found
+    assert_eq(_draining_prefer_standby(active, standby, &key), "data 2");
+    assert_eq(_draining_lookup_active(active, standby, &key), "data 2");
+
+    assert_eq(bgh_lookup(tracker, &key), "data 2");
+
+    // Insert something new during our refresh, using the same key
+    d = strdup("data 2.5");
+    assert(bgh_insert(tracker, &key, d) == BGH_OK);
+    assert_eq(_draining_lookup_active(active, standby, &key), "data 2.5");
+    assert_eq(_draining_prefer_standby(active, standby, &key), "data 2.5");
+    
+    // Overwrite something that's still in the active table
+    key.sip = 30;
+    row = _lookup_row(active, &key);
+    assert_eq(row->data, "data 3");
+
+    d = strdup("data 3.5");
+    assert(bgh_insert(tracker, &key, d) == BGH_OK);
+    row = _lookup_row(active, &key);
+    assert_eq(row->data, "data 3"); 
+    row = _lookup_row(standby, &key);
+    assert_eq(row->data, "data 3.5");
+    // 'Active' has the old row, but all regular lookups will be going to the standby table
+    assert_eq(bgh_lookup(tracker, &key), "data 3.5");
+
+    key.sip = 40;
+    assert_eq(bgh_lookup(tracker, &key), "data 4");
+    assert_eq(bgh_lookup(tracker, &key), "data 4"); // moved tables after last lookup
+    assert_eq(bgh_lookup(tracker, &key2), "data 4.5");
+
+    bgh_free_table(standby);
+    tracker->standby = NULL;
+
+    bgh_free(tracker);
+}
+
 int main(int argc, char **argv) {
     // Make rand repeatable
     srand(1);
@@ -674,8 +811,8 @@ int main(int argc, char **argv) {
         stress();
         return 0;
     }
-
     basic();
+    swapping();
     linear_probing();
     primes_test();
     drain();
