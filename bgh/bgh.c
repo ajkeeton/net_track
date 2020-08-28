@@ -9,7 +9,6 @@
 #include <string.h>
 #include <stdio.h>
 #include <assert.h>
-#include <pthread.h>
 #include <unistd.h>
 #include "bgh.h"
 #include "primes.h"
@@ -17,7 +16,7 @@
 void bgh_config_init(bgh_config_t *config) {
     int len = prime_total();
 
-    config->starting_rows = prime_at_idx(len/2); 
+    config->starting_rows = prime_at_idx(len/3); 
     config->min_rows = prime_at_idx(0);
     config->max_rows = prime_at_idx(len);
     config->timeout = BGH_DEFAULT_TIMEOUT;
@@ -48,10 +47,11 @@ void bgh_randomize_refreshes(bgh_t *b, float pct) {
     }
 }
 
-bgh_row_t *bgh_new_row() {
-    bgh_row_t *row = (bgh_row_t*)calloc(sizeof(bgh_row_t), 1);
+bgh_data_t *bgh_new_row() {
+    bgh_data_t *row = (bgh_data_t*)calloc(sizeof(bgh_data_t), 1);
     if(!row)
         return NULL;
+
     return row;
 };
 
@@ -64,10 +64,20 @@ bgh_t *bgh_new(void (*free_cb)(void *)) {
 
 void bgh_free_table(bgh_tbl_t *tbl) {
     for(int i=0; i<tbl->num_rows; i++) {
-        if(tbl->rows[i]->data) {
-            tbl->free_cb(tbl->rows[i]->data);
+        bgh_data_t *r = tbl->rows[i];
+        if(r->user) {
+            if(r->ref_count < 1) {
+                tbl->free_cb(r->user);
+                free(r);
+            }
+            else {
+                // Will free the row when it's released
+                // Hopefully the user hasn't lost the pointer...
+                r->no_parent_tbl = true;
+            }
         }
-        free(tbl->rows[i]);
+        else
+            free(r);
     }
 
     free(tbl->rows);
@@ -80,15 +90,23 @@ bgh_tbl_t *bgh_new_tbl(uint64_t rows, uint64_t max_inserts, void (*free_cb)(void
         return NULL;
 
     tbl->num_rows = rows;
-    tbl->rows = (bgh_row_t**)malloc(sizeof(bgh_row_t) * tbl->num_rows);
+    tbl->rows = (bgh_data_t**)malloc(sizeof(bgh_data_t) * tbl->num_rows);
 
     if(!tbl->rows) {
         free(tbl);
         return NULL;
     }
 
-    for(int i=0; i<tbl->num_rows; i++)
+    for(int i=0; i<tbl->num_rows; i++) {
         tbl->rows[i] = bgh_new_row();
+        if(!tbl->rows[i]) {
+            // A row failed to alloc. Delete all up to this point
+            for(int j=0; j<i; j++)
+                free(tbl->rows[j]);
+            free(tbl);
+            return NULL;
+        }
+    }
 
     tbl->free_cb = free_cb;
     tbl->inserted = tbl->collisions = 0;
@@ -124,19 +142,25 @@ uint64_t _update_size(bgh_config_t *config, int *idx, bgh_tbl_t *tbl) {
 
 static inline void _clear_table(bgh_tbl_t *tbl) {
     for(int i=0; i<tbl->num_rows; i++) {
-        if(tbl->rows[i]->data) {
-            tbl->free_cb(tbl->rows[i]->data);
-            tbl->rows[i]->data = NULL;
-            tbl->rows[i]->deleted = false;
-        }
+        bgh_data_t *r = tbl->rows[i];
+
+        if(!r->user || r->ref_count > 0) 
+            continue;
+
+        // If ref count > 0, don't delete, just leave in table
+        tbl->free_cb(r->user);
+
+        r->user = NULL;
+        r->deleted = false;
+        tbl->inserted--;
     }
 
-    tbl->inserted = tbl->collisions = 0;
+    tbl->collisions = 0;
 }
 
 static void *refresh_thread(void *ctx) {
     bgh_t *ssns = (bgh_t*)ctx;
-    static time_t last = 0;
+    time_t last = 0;
 
     last = time(NULL);
 
@@ -151,6 +175,8 @@ static void *refresh_thread(void *ctx) {
             continue;
         }
 
+        last = now;
+        
         // Calc new hash size
         uint64_t nrows = _update_size(&ssns->config, &pindex, ssns->active);
 
@@ -158,7 +184,6 @@ static void *refresh_thread(void *ctx) {
             // Just re-use this table
             _clear_table(ssns->standby);
         else {
-            // Delete old table
             if(ssns->standby) bgh_free_table(ssns->standby);
 
             uint64_t max_inserts = nrows * ssns->config.hash_full_pct/100.0;
@@ -168,8 +193,7 @@ static void *refresh_thread(void *ctx) {
 
         if(!ssns->standby) {
             // XXX Need way to handle/report this case gracefully
-            // For now, just clear the active table
-            _clear_table(ssns->active);
+            // For now, just do-over
             continue;
         }
 
@@ -190,8 +214,6 @@ static void *refresh_thread(void *ctx) {
         pthread_mutex_unlock(&ssns->lock);
 
         ssns->standby = old;
-
-        last = now;
     }
 
     return NULL;
@@ -224,16 +246,17 @@ bgh_t *bgh_config_new(bgh_config_t *config, void (*free_cb)(void *)) {
     return table;
 }
 
-void bgh_free(bgh_t *ssns) {
-    if(!ssns) return;
+void bgh_free(bgh_t *tbl) {
+    if(!tbl) return;
 
-    ssns->running = false;
-    pthread_join(ssns->refresh, NULL);
+    tbl->running = false;
+    pthread_join(tbl->refresh, NULL);
+    pthread_mutex_destroy(&tbl->lock);
 
-    bgh_free_table(ssns->active);
-    if(ssns->standby)
-        bgh_free_table(ssns->standby);
-    free(ssns);
+    bgh_free_table(tbl->active);
+    if(tbl->standby)
+        bgh_free_table(tbl->standby);
+    free(tbl);
 }
 
 static inline int key_eq(bgh_key_t *k1, bgh_key_t *k2) {
@@ -241,7 +264,7 @@ static inline int key_eq(bgh_key_t *k1, bgh_key_t *k2) {
     uint64_t *p2 = (uint64_t*)k2;
 
     return 
-        ((p1[0] == p2[0] && p1[1] == p1[1]) ||
+        ((p1[0] == p2[0] && p1[1] == p2[1]) ||
         (p1[0] == p2[1] && p1[1] == p2[0])) &&
         k1->vlan == k2->vlan;
 }
@@ -269,13 +292,13 @@ uint64_t hash_func(uint64_t mask, bgh_key_t *key) {
 
 int64_t _lookup_idx(bgh_tbl_t *table, bgh_key_t *key) {
     int64_t idx = hash_func(table->num_rows, key);
-    bgh_row_t *row = table->rows[idx];
+    bgh_data_t *row = table->rows[idx];
 
     // If nothing is/was stored here, just return it anyway.
     // We'll check later
     // The check for "deleted" is to deal with the case where there was 
     // previously a collision
-    if((!row->data && !row->deleted) || key_eq(key, &row->key))
+    if((!row->user && !row->deleted) || key_eq(key, &row->key))
         return idx;
 
     // There was a collision. Use linear probing
@@ -297,7 +320,7 @@ int64_t _lookup_idx(bgh_tbl_t *table, bgh_key_t *key) {
         if(idx >= table->num_rows)
             idx = 0;
 
-        bgh_row_t *row = table->rows[idx];
+        bgh_data_t *row = table->rows[idx];
 
         if(key_eq(key, &row->key)) {
             // Intentionally ignoring the collision count here. Otherwise, we 
@@ -305,7 +328,7 @@ int64_t _lookup_idx(bgh_tbl_t *table, bgh_key_t *key) {
             return idx;
         }
 
-        if(!row->data && !row->deleted) {
+        if(!row->user && !row->deleted) {
             table->collisions += collisions;
             return idx;
         }
@@ -316,9 +339,9 @@ int64_t _lookup_idx(bgh_tbl_t *table, bgh_key_t *key) {
     return -1;
 }
 
-bgh_row_t *_lookup_row(bgh_tbl_t *table, bgh_key_t *key) {
+bgh_data_t *_lookup_row(bgh_tbl_t *table, bgh_key_t *key) {
     int64_t idx = hash_func(table->num_rows, key);
-    bgh_row_t *row = table->rows[idx];
+    bgh_data_t *row = table->rows[idx];
 
     if(key_eq(key, &row->key))
         return row;
@@ -327,7 +350,7 @@ bgh_row_t *_lookup_row(bgh_tbl_t *table, bgh_key_t *key) {
     // We'll check later
     // The check for 'deleted' is to handle the case where
     // a collided row was moved
-    if(!row->data && !row->deleted)
+    if(!row->user && !row->deleted)
         return row;
 
     uint64_t start = idx++;
@@ -335,7 +358,7 @@ bgh_row_t *_lookup_row(bgh_tbl_t *table, bgh_key_t *key) {
         if(idx >= table->num_rows)
             idx = 0;
 
-        bgh_row_t *row = table->rows[idx];
+        bgh_data_t *row = table->rows[idx];
 
         if(key_eq(key, &row->key)) {
             // Intentionally ignoring the collision count here. Otherwise, we 
@@ -343,7 +366,7 @@ bgh_row_t *_lookup_row(bgh_tbl_t *table, bgh_key_t *key) {
             return row;
         }
 
-        if(!row->data && !row->deleted) {
+        if(!row->user && !row->deleted) {
             return row;
         }
 
@@ -353,144 +376,201 @@ bgh_row_t *_lookup_row(bgh_tbl_t *table, bgh_key_t *key) {
     return NULL;
 }
 
-bgh_stat_t bgh_insert_table(bgh_tbl_t *tbl, bgh_key_t *key, void *data) {
+bgh_data_t *_bgh_insert_table(bgh_tbl_t *tbl, bgh_key_t *key, void *data) { 
     // XXX Handle this case better ...
     // - should allow overwrites
     // - use to influence the size of the next hash table
     if(tbl->inserted > tbl->max_inserts)
-        return BGH_FULL;
+        return NULL;
 
     int64_t idx = _lookup_idx(tbl, key);
 
     if(idx < 0)
-        return BGH_EXCEPTION;
+        return NULL;
 
-    bgh_row_t *row = tbl->rows[idx];
+    bgh_data_t *nrow = tbl->rows[idx];
 
-    // If there was something there already, free it and overwrite
-    if(row->data)
-        tbl->free_cb(row->data);
-    else
+    if(!nrow->user)
         tbl->inserted++;
+    else if(nrow->ref_count < 1)
+        tbl->free_cb(nrow->user);
+    
+    // else... Ref count is non zero.
+    // Something is using it. Treating it as user error
 
-    row->deleted = false;
-    memcpy(&row->key, key, sizeof(row->key));
-    row->data = data;
-    return BGH_OK;
+    nrow->ref_count = 0;
+    nrow->deleted = false;
+    memcpy(&nrow->key, key, sizeof(nrow->key));
+    nrow->user = data;
+
+    return nrow;
 }
 
-bgh_stat_t bgh_insert(bgh_t *ssns, bgh_key_t *key, void *data) {
+// NOTE: Insert will overwrite any existing user data using the same key
+bgh_data_t *bgh_insert(bgh_t *tbl, bgh_key_t *key, void *data) {
     // null data is not allowed
-    // data is used to check if a row is used
+    // the user data pointer is used to check if a row is used
     if(!data)
-        return BGH_EXCEPTION;
+        return NULL;
 
-    pthread_mutex_lock(&ssns->lock);
-    if(ssns->refreshing) {
-        bgh_stat_t retval = bgh_insert_table(ssns->standby, key, data);
-        pthread_mutex_unlock(&ssns->lock);
-        return retval;
+    pthread_mutex_lock(&tbl->lock);
+    if(tbl->refreshing) {
+        // First check if it's in the active table. If so, move it to standby
+        int idx = _lookup_idx(tbl->active, key);
+        if(idx > -1) {
+            bgh_data_t *row = tbl->active->rows[idx];
+
+            // If the pointer differs, delete if ref count is < 2
+            // a ref_count of 1 is allowed since that just means we currently
+            // have one in use.. which makes sense
+            //
+            // NOTE: this calls the delete callback... user better be done with
+            // the old one
+            if(row->user && row->user != data && row->ref_count < 2) {
+                tbl->active->free_cb(row->user);
+                tbl->active->rows[idx]->user = NULL;
+            }
+            else
+                // User tried to overwrite old data with something new, but
+                // multiple things held the old data (in terms of ref count)
+                // This is invalid. To prevent crashes, just insert the new
+                // data into the standby table.
+
+                // Any future lookups during the refresh that go to the active 
+                // table first will return the old data. It will then overwrite
+                // the new data in the standby table
+                {}
+        }
+        bgh_data_t *ret = _bgh_insert_table(tbl->standby, key, data);
+        pthread_mutex_unlock(&tbl->lock);
+        return ret;
     }
-    pthread_mutex_unlock(&ssns->lock);
-    return bgh_insert_table(ssns->active, key, data);
+    pthread_mutex_unlock(&tbl->lock);
+    return _bgh_insert_table(tbl->active, key, data);
 }
 
-static inline void _move_tables(
-        bgh_tbl_t *active, bgh_tbl_t *standby, bgh_key_t *key, bgh_row_t *row) {
-    if(bgh_insert_table(standby, key, row->data) != BGH_OK)
-        return; // this makes sure it still gets deleted correctly
+bgh_data_t *bgh_insert_acquire(bgh_t *tbl, bgh_key_t *key, void *data) {
+    bgh_data_t *ret = bgh_insert(tbl, key, data);
+    if(!ret)
+        return NULL;
+    ret->ref_count++;
+    return ret;
+}
+
+static inline bgh_data_t *_move_tables(
+        bgh_tbl_t *active, bgh_tbl_t *standby, bgh_key_t *key, bgh_data_t *row) {            
+    bgh_data_t *nrow = _bgh_insert_table(standby, key, row->user);
+    if(!nrow) {
+        // We failed to insert it into the new table
+        return NULL; // this makes sure it still gets deleted correctly later
+    }
+
     active->inserted--;
-    row->data = NULL;
+    row->ref_count = 0;
+    row->user = NULL;
     row->deleted = true; // this is necessary to handle the case where there 
                          // was a previous collision with this row
+
+    return nrow;
 }
 
-void *_draining_lookup_active(
+bgh_data_t *_draining_lookup_active(
         bgh_tbl_t *active, bgh_tbl_t *standby, bgh_key_t *key) {
-    bgh_row_t *row = _lookup_row(active, key);
-    if(!row || !row->data) {
-        row = _lookup_row(standby, key);
-        if(row) 
-            return row->data;
-        return NULL;
-    }
+    bgh_data_t *row = _lookup_row(active, key);
+    if(!row || !row->user)
+        return _lookup_row(standby, key);
 
-    void *data = row->data;
-    _move_tables(active, standby, key, row);
-    return data;
+    // Row was found in the active table. Move to standby
+    return _move_tables(active, standby, key, row);
 }
 
-void *_draining_prefer_standby(
+bgh_data_t *_draining_prefer_standby(
         bgh_tbl_t *active, bgh_tbl_t *standby, bgh_key_t *key) {
-    bgh_row_t *row = _lookup_row(standby, key);
-    if(row && row->data) {
-        return row->data;
-    }
+    bgh_data_t *row = _lookup_row(standby, key);
+    if(row && row->user) 
+         return row;
 
     row = _lookup_row(active, key);
-    if(!row || !row->data)
+    if(!row || !row->user)
         return NULL;
 
-    void *data = row->data;
-    _move_tables(active, standby, key, row);
-    return data;
+    return _move_tables(active, standby, key, row);
 }
 
-void *bgh_lookup(bgh_t *ssns, bgh_key_t *key) {
-    void *data = NULL;
+bgh_data_t *bgh_acquire(bgh_t *ssns, bgh_key_t *key) {
+    bgh_data_t *row = NULL;
 
     pthread_mutex_lock(&ssns->lock);
     if(ssns->refreshing) {
         if(ssns->active->inserted > ssns->standby->inserted) {
-            data = _draining_lookup_active(ssns->active, ssns->standby, key);
+            row = _draining_lookup_active(ssns->active, ssns->standby, key);
         }
         else {
-            data = _draining_prefer_standby(ssns->active, ssns->standby, key);
+            row = _draining_prefer_standby(ssns->active, ssns->standby, key);
         }
+
         pthread_mutex_unlock(&ssns->lock);
 
-        return data;
+        if(row && row->user)
+            row->ref_count++;
+        return row;
     } 
     pthread_mutex_unlock(&ssns->lock);
         
-    bgh_row_t *row = _lookup_row(ssns->active, key);
-    if(row)
-        return row->data;
+    row = _lookup_row(ssns->active, key);
+    if(row && row->user) {
+        row->ref_count++;
+        return row;
+    }
+
     return NULL;
 }
 
-void bgh_delete_from_table(bgh_tbl_t *table, bgh_key_t *key) {
-    bgh_row_t *row = _lookup_row(table, key);
-    if(!row || !row->data) 
+void bgh_release(bgh_t *tbl, bgh_data_t *row) {
+    if(!row)
+        return;
+        
+    row->ref_count--;
+}
+
+void bgh_delete_from_table(bgh_tbl_t *tbl, bgh_key_t *key) {
+    bgh_data_t *row = _lookup_row(tbl, key);
+    if(!row || !row->user) 
         return;
 
-    table->free_cb(row->data);
+    // XXX Deletes ignore ref_count
+    // Uh oh...
+    //if(row->ref_count >= 2)
+    //    return;
 
-    table->inserted--;
-    row->data = NULL;
+    tbl->free_cb(row->user);
+
+    tbl->inserted--;
+    row->user = NULL;
     row->deleted = true;
 }
 
-void bgh_clear(bgh_t *ssns, bgh_key_t *key) {
-    pthread_mutex_lock(&ssns->lock);
-    if(ssns->refreshing) {
+// XXX Clear ignores ref_count
+void bgh_clear(bgh_t *tbl, bgh_key_t *key) {
+    pthread_mutex_lock(&tbl->lock);
+    if(tbl->refreshing) {
         // XXX Revisit: Not optimal to just do both this way, but this is an edge case
-        bgh_delete_from_table(ssns->active, key);
-        bgh_delete_from_table(ssns->standby, key);
-        pthread_mutex_unlock(&ssns->lock);
+        bgh_delete_from_table(tbl->active, key);
+        bgh_delete_from_table(tbl->standby, key);
+        pthread_mutex_unlock(&tbl->lock);
         return;
     }
-    pthread_mutex_unlock(&ssns->lock);
-    bgh_delete_from_table(ssns->active, key);
+    pthread_mutex_unlock(&tbl->lock);
+    bgh_delete_from_table(tbl->active, key);
 }
 
-void bgh_get_stats(bgh_t *ssns, bgh_stats_t *stats) {
-    pthread_mutex_lock(&ssns->lock);
-    stats->in_refresh = ssns->refreshing;
-    stats->num_rows = ssns->active->num_rows;
-    stats->inserted = ssns->active->inserted;
-    stats->collisions = ssns->active->collisions;
-    stats->max_inserts = ssns->active->max_inserts;
-    pthread_mutex_unlock(&ssns->lock);
+void bgh_get_stats(bgh_t *tbl, bgh_stats_t *stats) {
+    pthread_mutex_lock(&tbl->lock);
+    stats->in_refresh = tbl->refreshing;
+    stats->num_rows = tbl->active->num_rows;
+    stats->inserted = tbl->active->inserted;
+    stats->collisions = tbl->active->collisions;
+    stats->max_inserts = tbl->active->max_inserts;
+    pthread_mutex_unlock(&tbl->lock);
 }
 

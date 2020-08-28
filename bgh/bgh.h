@@ -12,6 +12,7 @@
 #include <sys/types.h>
 #include <stdbool.h>
 #include <time.h>
+#include <pthread.h>
 
 #define BGH_DEFAULT_TIMEOUT 60 // seconds
 #define BGH_DEFAULT_REFRESH_PERIOD 120 // seconds
@@ -50,13 +51,16 @@ typedef struct _bgh_key_t {
     uint8_t vlan;
 } bgh_key_t;
 
-typedef struct _bgh_row_t {
-    void *data;
+typedef struct _bgh_data_t {
+    void *user;
+    int ref_count;
     // Necessary to prevent drained or deleted rows from preventing lookups 
     // from working when there had been a collision
-    bool deleted; 
+    bool deleted,
+         no_parent_tbl;
+    // pthread_mutex_t release_lock;
     bgh_key_t key;
-} bgh_row_t;
+} bgh_data_t;
 
 typedef struct _bgh_stats_t {
     uint64_t inserted, 
@@ -76,7 +80,7 @@ typedef struct _bgh_tbl_t {
              collisions,
              max_inserts;
     uint64_t num_rows;
-    bgh_row_t **rows;
+    bgh_data_t **rows;
 } bgh_tbl_t;
 
 typedef struct _bgh_t {
@@ -110,13 +114,20 @@ void bgh_config_init(bgh_config_t *config);
 // Free session tracker
 void bgh_free(bgh_t *tracker);
 
-// Lookup entry
-void *bgh_lookup(bgh_t *tracker, bgh_key_t *key);
+// Lookup entry. Points to user data, if any. Increments reference count
+bgh_data_t *bgh_acquire(bgh_t *tracker, bgh_key_t *key);
+
+// Release row, decrementing reference count
+void bgh_release(bgh_t *tracker, bgh_data_t *data);
 
 // Insert entry
-bgh_stat_t bgh_insert(bgh_t *tracker, bgh_key_t *key, void *data);
+// Data is subject to race condition if used. Use insert_acquire to keep reference
+bgh_data_t *bgh_insert(bgh_t *tracker, bgh_key_t *key, void *data);
 
-// Delete entry 
+// Insert entry but return row with ref_count = 1
+bgh_data_t *bgh_insert_acquire(bgh_t *tracker, bgh_key_t *key, void *data);
+
+// Delete entry and free user data if any
 void bgh_clear(bgh_t *tracker, bgh_key_t *key);
 
 // Populate given stats structure

@@ -12,11 +12,11 @@
 #include "../bgh/bgh.h"
 
 extern "C" {
-void *_draining_lookup_active(
+bgh_data_t *_draining_lookup_active(
         bgh_tbl_t *active, bgh_tbl_t *standby, bgh_key_t *key);
-void *_draining_prefer_standby(
+bgh_data_t *_draining_prefer_standby(
         bgh_tbl_t *active, bgh_tbl_t *standby, bgh_key_t *key);
-bgh_stat_t bgh_insert_table(bgh_tbl_t *tbl, bgh_key_t *key, void *data);
+bgh_stat_t _bgh_insert_table(bgh_tbl_t *tbl, bgh_key_t *key, void *data);
 int64_t _lookup_idx(bgh_tbl_t *table, bgh_key_t *key);
 bgh_tbl_t 
 *bgh_new_tbl(uint64_t rows, uint64_t max_inserts, void (*free_cb)(void *));
@@ -26,7 +26,7 @@ uint64_t prime_at_idx(int idx);
 int prime_nearest_idx(uint64_t val);
 uint64_t prime_larger_idx(int idx);
 uint64_t prime_smaller_idx(int idx);
-bgh_row_t *_lookup_row(bgh_tbl_t *table, bgh_key_t *key);
+bgh_data_t *_lookup_row(bgh_tbl_t *table, bgh_key_t *key);
 uint64_t hash_func(uint64_t mask, bgh_key_t *key);
 }
 
@@ -40,16 +40,24 @@ void assert_eq(void *p, const char *s) {
     assert(!strcmp((char *)p, s));
 }
 
+void assert_lookup_eq(bgh_t *t,  bgh_key_t &key, const char *s) {
+    bgh_data_t *d = bgh_acquire(t, &key); 
+
+    assert_eq(d->user, s);
+
+    bgh_release(t, d);
+}
+
 void assert_lookup_eq(bgh_tbl_t *t, bgh_key_t *key, const char *val) {
     int64_t idx = _lookup_idx(t, key);
 
     assert(idx >= 0);
-    assert_eq(t->rows[idx]->data, val);
+    assert_eq(t->rows[idx]->user, val);
 }
 
 void assert_lookup_clear(bgh_tbl_t *t, bgh_key_t *key) {
     int64_t idx = _lookup_idx(t, key);
-    assert(idx < 0 || !t->rows[idx]->data);
+    assert(idx < 0 || !t->rows[idx]->user);
 }
 
 void assert_refresh_within(bgh_t *b, int seconds) {
@@ -112,16 +120,21 @@ void basic() {
 
     // Lookup each
     key.sip = 10;
-    assert_eq(bgh_lookup(tracker, &key), "foo");
+    assert_lookup_eq(tracker, key, "foo");
 
     key.sip = 20;
-    assert_eq(bgh_lookup(tracker, &key), "bar");
-    // Overwrite
+    assert_lookup_eq(tracker, key, "bar");
+    
+        key.sip = 30;
+        assert_lookup_eq(tracker, key, "baz");
+        key.sip = 20;
+
+    // Overwrite    
     bgh_insert(tracker, &key, strdup("foobazzybar"));
-    assert_eq(bgh_lookup(tracker, &key), "foobazzybar");
+    assert_lookup_eq(tracker, key, "foobazzybar");
 
     key.sip = 30;
-    assert_eq(bgh_lookup(tracker, &key), "baz");
+    assert_lookup_eq(tracker, key, "baz");
 
     // Swap source and IP, should get same session data
     bgh_key_t key2;
@@ -131,24 +144,25 @@ void basic() {
     key2.sport = 5000;
     key2.vlan = 5;
 
-    assert_eq(bgh_lookup(tracker, &key2), "baz");
+    assert_lookup_eq(tracker, key2, "baz");
 
     key.sip = 20;
     bgh_clear(tracker, &key);
 
     key.sip = 10;
+    bgh_data_t *d = bgh_acquire(tracker, &key);
+    bgh_release(tracker, d);
+    // Clear after release ... no boom
     bgh_clear(tracker, &key);
-    assert(!bgh_lookup(tracker, &key));
+    // Can't acquire again
+    assert(!bgh_acquire(tracker, &key));
 
-    // Already deleted
-    bgh_clear(tracker, &key);
-    assert(!bgh_lookup(tracker, &key));
     key.sip = 20;
     bgh_clear(tracker, &key);
-    assert(!bgh_lookup(tracker, &key));
+    assert(!bgh_acquire(tracker, &key));
     key.sip = 30;
     bgh_clear(tracker, &key);
-    assert(!bgh_lookup(tracker, &key));
+    assert(!bgh_acquire(tracker, &key));
 
     bgh_free(tracker);
 }
@@ -169,11 +183,11 @@ void timeouts() {
     // Bzero'ing to clean up pad bytes and prevent valgrind from complaining
     bzero(&key, sizeof(key)); 
     
-    // Add three, but across the refresh + timeout period
+    // Add three, but cross the refresh + timeout period
     key.sip = 1;
     bgh_insert(tracker, &key, strdup("foo"));
     sleep(1);
-    assert_eq(bgh_lookup(tracker, &key), "foo");
+    assert_lookup_eq(tracker, key, "foo");
 
     assert(!tracker->refreshing);
 
@@ -195,7 +209,7 @@ void timeouts() {
     assert(tracker->standby->inserted == 0);
 
     key.sip = 222;
-    assert_eq(bgh_lookup(tracker, &key), "bar");
+    assert_lookup_eq(tracker, key, "bar");
     assert(tracker->standby->inserted == 1);
     assert(tracker->active->inserted == 1);
     assert(!tracker->standby->collisions);
@@ -209,11 +223,11 @@ void timeouts() {
 
     // Lookup 2 again. Should be in the standby table
     key.sip = 222;
-    assert_eq(bgh_lookup(tracker, &key), "bar");
+    assert_lookup_eq(tracker, key, "bar");
     assert(!tracker->active->collisions);
     assert(!tracker->standby->collisions);
     usleep(600000);
-    assert_eq(bgh_lookup(tracker, &key), "bar");
+    assert_lookup_eq(tracker, key, "bar");
 
     assert(!tracker->refreshing);
     assert(tracker->active->inserted == 2);
@@ -221,11 +235,11 @@ void timeouts() {
 
     // 1 is timed out and gone
     key.sip = 1;
-    assert(!bgh_lookup(tracker, &key));
+    assert(!bgh_acquire(tracker, &key));
     key.sip = 222;
-    assert_eq(bgh_lookup(tracker, &key), "bar");
+    assert_lookup_eq(tracker, key, "bar");
     key.sip = 3333;
-    assert_eq(bgh_lookup(tracker, &key), "baz");
+    assert_lookup_eq(tracker, key, "baz");
 
     bgh_free(tracker);
 }
@@ -298,7 +312,11 @@ struct key_cmp {
 void bench() {
     printf("%s\n", __func__);
 
-    bgh_t *tracker = bgh_new(nop_free_cb);
+    bgh_config_t conf;
+    bgh_config_init(&conf);
+    conf.starting_rows = 6000101;
+
+    bgh_t *tracker = bgh_config_new(&conf, nop_free_cb);
     bgh_key_t keys[NUM_ITS];
     memset(&keys, 0, sizeof(keys));
 
@@ -325,7 +343,9 @@ void bench() {
     assert(tracker->active->collisions < 10);
 
     for(int i=0; i<NUM_ITS*100; i++) {
-        assert(bgh_lookup(tracker, &keys[i % NUM_ITS]));
+        bgh_data_t *d = bgh_acquire(tracker, &keys[i % NUM_ITS]);
+        assert(d);
+        bgh_release(tracker, d);
     }
 
     for(int i=0; i<NUM_ITS; i++) 
@@ -397,8 +417,7 @@ void time_draining() {
 
     // First, insert for refresh_period/2
     while(time(NULL) - start < conf.refresh_period/2 - 1) {
-        assert(bgh_insert(tracker, &keys[total % NUM_ITS], (void*)"nodelete")
-             != BGH_FULL);
+        assert(bgh_insert(tracker, &keys[total % NUM_ITS], (void*)"nodelete"));
         total++;
     }
     printf("%llu inserts\n", total);
@@ -407,7 +426,9 @@ void time_draining() {
     total = 0;
     start = time(NULL);
     while(time(NULL) - start < conf.refresh_period/2 - 1) {
-        assert(bgh_lookup(tracker, &keys[total % NUM_ITS]));
+        bgh_data_t *d = bgh_acquire(tracker, &keys[total % NUM_ITS]);
+        assert(d->user);
+        bgh_release(tracker, d);
         total++;
     }
     printf("%llu lookups \n", total);
@@ -421,7 +442,7 @@ void time_draining() {
     total = 0;
     start = time(NULL);
     while(time(NULL) - start < conf.refresh_period/2 - 1) {
-        assert(bgh_insert(tracker, &keys[total % NUM_ITS], (void*)"nodelete") != BGH_FULL);
+        assert(bgh_insert(tracker, &keys[total % NUM_ITS], (void*)"nodelete"));
         total++;
     }
     printf("%llu inserts\n", total);
@@ -429,7 +450,9 @@ void time_draining() {
     total = 0;
     start = time(NULL);
     while(time(NULL) - start < conf.refresh_period/2 - 1) {
-        assert(bgh_lookup(tracker, &keys[total % NUM_ITS]));
+        bgh_data_t *d = bgh_acquire(tracker, &keys[total % NUM_ITS]);
+        assert(d->user);
+        bgh_release(tracker, d);
         total++;
     }
     printf("%llu lookups \n", total);
@@ -455,9 +478,9 @@ void drain() {
     bzero(&key, sizeof(key)); 
 
     key.sip = 111;
-    bgh_insert_table(tracker->active, &key, strdup("first"));
+    _bgh_insert_table(tracker->active, &key, strdup("first"));
     key.sip = 222;
-    bgh_insert_table(tracker->active, &key, strdup("second"));
+    _bgh_insert_table(tracker->active, &key, strdup("second"));
 
     key.sip = 111;
 
@@ -466,23 +489,25 @@ void drain() {
     assert_lookup_eq(tracker->active, &key, "first");
     assert_lookup_eq(tracker->active, &key, "first");
     // this moves the entry from the active to the standby table
-    assert_eq(
-        _draining_lookup_active(tracker->active, tracker->standby, &key), "first");
+    bgh_data_t *row = _draining_lookup_active(tracker->active, tracker->standby, &key);
+    assert_eq(row->user, "first");
+        
     // Deleted from active table
     assert_lookup_clear(tracker->active, &key);
     // In standby
     assert_lookup_eq(tracker->standby, &key, "first");
 
     // Lookup standby "favors" the standby table
-    assert_eq(
-        _draining_prefer_standby(tracker->active, tracker->standby, &key), "first");
+    row = _draining_prefer_standby(tracker->active, tracker->standby, &key);
+    assert_eq(row->user, "first");
 
     key.sip = 222;
 
     // Confirm _draining_prefer_standby also moves from active to standby
     assert_lookup_eq(tracker->active, &key, "second");
-    assert_eq(
-        _draining_prefer_standby(tracker->active, tracker->standby, &key), "second");
+
+    row = _draining_prefer_standby(tracker->active, tracker->standby, &key);
+    assert_eq(row->user, "second");
     // Confirm no longer in active, only in standby
     assert_lookup_clear(tracker->active, &key);
     assert_lookup_eq(tracker->standby, &key, "second");
@@ -618,8 +643,10 @@ void stress() {
                 printf("- Insert time avg: %llu ns\n", insert_total_time/insert_count);
 
             failed_insert = 0;
-            lookup_total_time = lookup_count = 0,
-            insert_total_time = insert_count  = 0;
+            lookup_total_time = 0;
+            lookup_count = 1,
+            insert_total_time = 0;
+            insert_count  = 1;
 
             bgh_randomize_refreshes(tracker, 5);
         }
@@ -640,7 +667,7 @@ void stress() {
             void *d = strdup("data");
 
             clock_gettime(CLOCK_MONOTONIC, &tstart);
-            if(bgh_insert(tracker, &key, d) != BGH_OK) {
+            if(!bgh_insert(tracker, &key, d)) {
                 failed_insert++;
                 free(d);
             }
@@ -654,7 +681,7 @@ void stress() {
         if(!(rand() % 2)) {
             key = keys[rand() % keys.size()];
             clock_gettime(CLOCK_MONOTONIC, &tstart);
-            bgh_lookup(tracker, &key);
+            bgh_release(tracker, bgh_acquire(tracker, &key));
             lookup_total_time += nanos_total(&tstart);
             lookup_count++;
             // assert_eq(bgh_lookup(tracker, &key), "data");
@@ -708,26 +735,26 @@ void swapping() {
     key.sip = 10;
 
     void *d = strdup("data");
-    assert(bgh_insert(tracker, &key, d) == BGH_OK);
+    assert(bgh_insert(tracker, &key, d));
 
     key.sip = 20;
     d = strdup("data 2");
-    assert(bgh_insert(tracker, &key, d) == BGH_OK);
+    assert(bgh_insert(tracker, &key, d));
 
     key.sip = 30;
     d = strdup("data 3");
-    assert(bgh_insert(tracker, &key, d) == BGH_OK);
+    assert(bgh_insert(tracker, &key, d));
 
     key.sip = 40;
     d = strdup("data 4");
-    assert(bgh_insert(tracker, &key, d) == BGH_OK);
+    assert(bgh_insert(tracker, &key, d));
 
     // Force a collision
     bgh_key_t key2 = find_collision(key, conf.starting_rows);
     // Make sure we have a colliding row with a different key
     assert(memcmp(&key, &key2, sizeof(key)));
     d = strdup("data 4.5");
-    assert(bgh_insert(tracker, &key2, d) == BGH_OK);
+    assert(bgh_insert(tracker, &key2, d));
 
     bgh_tbl_t *active = tracker->active;
 
@@ -737,65 +764,73 @@ void swapping() {
 
     // Sanity - after the first insert, key is in active table only
     key.sip = 10;
-    bgh_row_t *row = _lookup_row(active, &key);
-    assert_eq(row->data, "data");
+    bgh_data_t *row = _lookup_row(active, &key);
+    assert_eq(row->user, "data");
     row = _lookup_row(standby, &key);
-    assert(!row->data);
+    assert(!row->user);
 
     tracker->refreshing = true;
 
     // We're refreshing, so lookups on 'active' should cause the row to 'move'
     // to the standby table
-    assert_eq(_draining_lookup_active(active, standby, &key), "data");
+    row = _draining_lookup_active(active, standby, &key);
+
+    assert_eq(row->user, "data");
 
     // Make sure no longer in 'active'
     row = _lookup_row(active, &key);
-    assert(!row->data);
+    assert(!row->user);
     row = _lookup_row(standby, &key);
-    assert_eq(row->data, "data");
+    assert_eq(row->user, "data");
 
     key.sip = 20;
     // Make sure in active
     row = _lookup_row(active, &key);
-    assert_eq(row->data, "data 2");
+    assert_eq(row->user, "data 2");
     // Moves row
-    assert_eq(_draining_prefer_standby(active, standby, &key), "data 2");
+    row = _draining_prefer_standby(active, standby, &key);
+    assert_eq(row->user, "data 2");
     // Make sure no longer in 'active'
     row = _lookup_row(active, &key);
-    assert(!row->data);
+    assert(!row->user);
     row = _lookup_row(standby, &key);
-    assert_eq(row->data, "data 2");
+    assert_eq(row->user, "data 2");
 
     // We've moved. Make sure we're still found
-    assert_eq(_draining_prefer_standby(active, standby, &key), "data 2");
-    assert_eq(_draining_lookup_active(active, standby, &key), "data 2");
+    row = _draining_prefer_standby(active, standby, &key);
+    assert_eq(row->user, "data 2");
+    row = _draining_lookup_active(active, standby, &key);
+    assert_eq(row->user, "data 2");
 
-    assert_eq(bgh_lookup(tracker, &key), "data 2");
+    assert_lookup_eq(tracker, key, "data 2");
 
     // Insert something new during our refresh, using the same key
     d = strdup("data 2.5");
-    assert(bgh_insert(tracker, &key, d) == BGH_OK);
-    assert_eq(_draining_lookup_active(active, standby, &key), "data 2.5");
-    assert_eq(_draining_prefer_standby(active, standby, &key), "data 2.5");
+    assert(bgh_insert(tracker, &key, d));
+    row = _draining_lookup_active(active, standby, &key);
+    assert_eq(row->user, "data 2.5");
+    row = _draining_prefer_standby(active, standby, &key);
+    assert_eq(row->user, "data 2.5");
     
     // Overwrite something that's still in the active table
     key.sip = 30;
     row = _lookup_row(active, &key);
-    assert_eq(row->data, "data 3");
+    assert_eq(row->user, "data 3");
 
     d = strdup("data 3.5");
-    assert(bgh_insert(tracker, &key, d) == BGH_OK);
-    row = _lookup_row(active, &key);
-    assert_eq(row->data, "data 3"); 
+    assert(bgh_insert(tracker, &key, d));
+    //row = _lookup_row(active, &key);
+    //assert_eq(row->user, "data 3"); 
     row = _lookup_row(standby, &key);
-    assert_eq(row->data, "data 3.5");
+    assert_eq(row->user, "data 3.5");
     // 'Active' has the old row, but all regular lookups will be going to the standby table
-    assert_eq(bgh_lookup(tracker, &key), "data 3.5");
+    assert_lookup_eq(tracker, key, "data 3.5");
 
     key.sip = 40;
-    assert_eq(bgh_lookup(tracker, &key), "data 4");
-    assert_eq(bgh_lookup(tracker, &key), "data 4"); // moved tables after last lookup
-    assert_eq(bgh_lookup(tracker, &key2), "data 4.5");
+    assert_lookup_eq(tracker, key, "data 4");
+    // moved tables after last lookup. make sure we still find it
+    assert_lookup_eq(tracker, key, "data 4");
+    assert_lookup_eq(tracker, key2, "data 4.5");
 
     bgh_free_table(standby);
     tracker->standby = NULL;

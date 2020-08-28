@@ -98,9 +98,10 @@ void pcap_cb(uint8_t *args, const struct pcap_pkthdr *header, const uint8_t *pac
     key.dport = tcp->th_dport;
     key.vlan = 0;
 
-    ssn_data_t *ssn = (ssn_data_t*)bgh_lookup(tracker, &key);
+    ssn_data_t *ssn = NULL;
+    bgh_data_t *d = bgh_acquire(tracker, &key);
 
-    if(!ssn) {
+    if(!d) {
         // New session
         printf("New session: %s:%d -> %s:%d size %d\n", 
             inet_ntoa(ip->ip_src), ntohs(tcp->th_sport), 
@@ -108,14 +109,16 @@ void pcap_cb(uint8_t *args, const struct pcap_pkthdr *header, const uint8_t *pac
 
         ssn = new ssn_data_t;
         ssn->count = 0;
-        bgh_stat_t stat = bgh_insert(tracker, &key, ssn);
-        if(stat != BGH_OK) {
-            printf("Failed to save session: %d\n", stat);
+        d = bgh_insert_acquire(tracker, &key, ssn);
+        if(!d) {
+            puts("Failed to save session");
             exit(-1);
         }
     }
 
+    ssn = (ssn_data_t*)d->user;
     ssn->count++;
+    bgh_release(tracker, d);
 }
 
 void free_data_cb(void *p) {
