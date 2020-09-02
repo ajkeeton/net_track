@@ -511,9 +511,12 @@ bgh_data_t *bgh_acquire(bgh_t *ssns, bgh_key_t *key) {
 
         pthread_mutex_unlock(&ssns->lock);
 
-        if(row && row->user)
+        if(row && row->user) {
             row->ref_count++;
-        return row;
+            return row;
+        }
+        
+        return NULL;
     } 
     pthread_mutex_unlock(&ssns->lock);
         
@@ -573,4 +576,3 @@ void bgh_get_stats(bgh_t *tbl, bgh_stats_t *stats) {
     stats->max_inserts = tbl->active->max_inserts;
     pthread_mutex_unlock(&tbl->lock);
 }
-
