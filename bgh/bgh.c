@@ -62,11 +62,11 @@ bgh_t *bgh_new(void (*free_cb)(void *)) {
     return bgh_config_new(&config, free_cb);
 }
 
-void bgh_free_table(bgh_tbl_t *tbl) {
+void _bgh_free_table(bgh_tbl_t *tbl, bool force) {
     for(int i=0; i<tbl->num_rows; i++) {
         bgh_data_t *r = tbl->rows[i];
         if(r->user) {
-            if(r->ref_count < 1) {
+            if(r->ref_count < 1 || force) {
                 tbl->free_cb(r->user);
                 free(r);
             }
@@ -74,6 +74,7 @@ void bgh_free_table(bgh_tbl_t *tbl) {
                 // Will free the row when it's released
                 // Hopefully the user hasn't lost the pointer...
                 r->no_parent_tbl = true;
+                // XXX Not currently used
             }
         }
         else
@@ -184,7 +185,7 @@ static void *refresh_thread(void *ctx) {
             // Just re-use this table
             _clear_table(ssns->standby);
         else {
-            if(ssns->standby) bgh_free_table(ssns->standby);
+            if(ssns->standby) _bgh_free_table(ssns->standby, false);
 
             uint64_t max_inserts = nrows * ssns->config.hash_full_pct/100.0;
             // Create new hash
@@ -196,7 +197,7 @@ static void *refresh_thread(void *ctx) {
             // For now, just do-over
             continue;
         }
-
+    
         ssns->refreshing = true;
 
         // When we're refreshing, all new sessions go into the new table
@@ -253,9 +254,9 @@ void bgh_free(bgh_t *tbl) {
     pthread_join(tbl->refresh, NULL);
     pthread_mutex_destroy(&tbl->lock);
 
-    bgh_free_table(tbl->active);
+    _bgh_free_table(tbl->active, true);
     if(tbl->standby)
-        bgh_free_table(tbl->standby);
+        _bgh_free_table(tbl->standby, true);
     free(tbl);
 }
 
@@ -426,11 +427,12 @@ bgh_data_t *bgh_insert(bgh_t *tbl, bgh_key_t *key, void *data) {
             //
             // NOTE: this calls the delete callback... user better be done with
             // the old one
-            if(row->user && row->user != data && row->ref_count < 2) {
-                tbl->active->free_cb(row->user);
-                tbl->active->rows[idx]->user = NULL;
-            }
-            else
+            if(row->user) { 
+                if(row->user != data && row->ref_count < 2) {
+                    tbl->active->free_cb(row->user);
+                    tbl->active->rows[idx]->user = NULL;
+                }
+                else 
                 // User tried to overwrite old data with something new, but
                 // multiple things held the old data (in terms of ref count)
                 // This is invalid. To prevent crashes, just insert the new
@@ -439,7 +441,8 @@ bgh_data_t *bgh_insert(bgh_t *tbl, bgh_key_t *key, void *data) {
                 // Any future lookups during the refresh that go to the active 
                 // table first will return the old data. It will then overwrite
                 // the new data in the standby table
-                {}
+                { }
+            }
         }
         bgh_data_t *ret = _bgh_insert_table(tbl->standby, key, data);
         pthread_mutex_unlock(&tbl->lock);

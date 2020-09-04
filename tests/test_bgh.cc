@@ -17,10 +17,10 @@ bgh_data_t *_draining_lookup_active(
 bgh_data_t *_draining_prefer_standby(
         bgh_tbl_t *active, bgh_tbl_t *standby, bgh_key_t *key);
 bgh_stat_t _bgh_insert_table(bgh_tbl_t *tbl, bgh_key_t *key, void *data);
+void _bgh_free_table(bgh_tbl_t *tbl, bool force);
 int64_t _lookup_idx(bgh_tbl_t *table, bgh_key_t *key);
 bgh_tbl_t 
 *bgh_new_tbl(uint64_t rows, uint64_t max_inserts, void (*free_cb)(void *));
-void bgh_free_table(bgh_tbl_t *tbl);
 int prime_total();
 uint64_t prime_at_idx(int idx);
 int prime_nearest_idx(uint64_t val);
@@ -65,6 +65,7 @@ void assert_refresh_within(bgh_t *b, int seconds) {
 
     while(!b->refreshing) {
         assert(time(NULL) - start <= seconds);
+        usleep(1);
     }
 }
 
@@ -125,9 +126,9 @@ void basic() {
     key.sip = 20;
     assert_lookup_eq(tracker, key, "bar");
     
-        key.sip = 30;
-        assert_lookup_eq(tracker, key, "baz");
-        key.sip = 20;
+    key.sip = 30;
+    assert_lookup_eq(tracker, key, "baz");
+    key.sip = 20;
 
     // Overwrite    
     bgh_insert(tracker, &key, strdup("foobazzybar"));
@@ -175,7 +176,7 @@ void timeouts() {
     bgh_config_init(&conf);
     conf.timeout = 1;
     conf.starting_rows = 31;
-    conf.refresh_period = 2;
+    conf.refresh_period = 3;
 
     bgh_t *tracker = bgh_config_new(&conf, free_cb);
 
@@ -195,7 +196,7 @@ void timeouts() {
     bgh_insert(tracker, &key, strdup("bar"));
 
     // wait for refresh to start
-    assert_refresh_within(tracker, 2);
+    assert_refresh_within(tracker, 4);
 
     // Make sure we still have both 
     assert(tracker->active->inserted == 2);
@@ -203,7 +204,7 @@ void timeouts() {
     // Table is draining.
     // Let "1" expire, lookup "2" (thereby refreshing it), and insert "3"
     // Wait .5 seconds
-    usleep(500000);
+    usleep(750000);
     assert(tracker->refreshing);
     assert(tracker->active->inserted == 2);
     assert(tracker->standby->inserted == 0);
@@ -554,6 +555,58 @@ void resize() {
     bgh_free(tracker);
 }
 
+void resize_non_zero_refs() {
+    printf("%s\n", __func__);
+
+    bgh_config_t conf;
+    bgh_config_init(&conf);
+    conf.starting_rows = 100003;
+    conf.refresh_period = 2;
+    conf.timeout = 1;
+
+    bgh_t *tracker = bgh_config_new(&conf, free_cb);
+    bgh_key_t key;
+    // Bzero'ing to clean up pad bytes and prevent valgrind from complaining
+    bzero(&key, sizeof(key)); 
+    key.sip = 1;
+    
+    bgh_data_t *data = bgh_insert_acquire(tracker, &key, (void*)strdup("foo"));
+    assert(data && data->user);
+
+    printf("%s: %d\n", __FILE__, __LINE__);
+    // Get to mid-refresh
+    usleep(2500000);
+
+    printf("%s: %d\n", __FILE__, __LINE__);
+    assert(tracker->refreshing);
+
+    key.sip = 2;
+    bgh_data_t *data2 = bgh_insert_acquire(tracker, &key, strdup("foo2"));
+    assert(data2 && data2->user);
+    printf("%s: %d\n", __FILE__, __LINE__);
+
+    //usleep(6000000);
+    //assert(!tracker->refreshing);
+    while(tracker->refreshing) {
+        usleep(50000);
+        puts(".");
+    }
+
+    assert_lookup_eq(tracker, key, "foo2");
+    key.sip = 1;
+    assert(!bgh_acquire(tracker, &key));
+    assert(data && data->user);
+
+    bgh_release(tracker, data);
+
+    while(!tracker->refreshing) {
+        usleep(50000);
+        puts(".");
+    }
+
+    bgh_free(tracker);
+}
+
 std::vector<bgh_key_t> keys;
 
 bgh_key_t gen_rand_key() {
@@ -832,7 +885,7 @@ void swapping() {
     assert_lookup_eq(tracker, key, "data 4");
     assert_lookup_eq(tracker, key2, "data 4.5");
 
-    bgh_free_table(standby);
+    _bgh_free_table(standby, false);
     tracker->standby = NULL;
 
     bgh_free(tracker);
@@ -846,12 +899,14 @@ int main(int argc, char **argv) {
         stress();
         return 0;
     }
+
     basic();
     swapping();
     linear_probing();
     primes_test();
     drain();
     resize();
+    resize_non_zero_refs();
     time_draining();
     timeouts();
     bench();
