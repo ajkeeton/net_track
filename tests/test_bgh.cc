@@ -61,6 +61,7 @@ void assert_lookup_clear(bgh_tbl_t *t, bgh_key_t *key) {
 }
 
 void assert_refresh_within(bgh_t *b, int seconds) {
+
     time_t start = time(NULL);
 
     while(!b->refreshing) {
@@ -573,22 +574,18 @@ void resize_non_zero_refs() {
     bgh_data_t *data = bgh_insert_acquire(tracker, &key, (void*)strdup("foo"));
     assert(data && data->user);
 
-    printf("%s: %d\n", __FILE__, __LINE__);
     // Get to mid-refresh
     usleep(2500000);
-
-    printf("%s: %d\n", __FILE__, __LINE__);
     assert(tracker->refreshing);
 
     key.sip = 2;
     bgh_data_t *data2 = bgh_insert_acquire(tracker, &key, strdup("foo2"));
     assert(data2 && data2->user);
-    printf("%s: %d\n", __FILE__, __LINE__);
 
     //usleep(6000000);
     //assert(!tracker->refreshing);
     while(tracker->refreshing) {
-        usleep(50000);
+        usleep(100000);
         puts(".");
     }
 
@@ -600,7 +597,7 @@ void resize_non_zero_refs() {
     bgh_release(tracker, data);
 
     while(!tracker->refreshing) {
-        usleep(50000);
+        usleep(100000);
         puts(".");
     }
 
@@ -773,6 +770,7 @@ bgh_key_t find_collision(bgh_key_t src, uint64_t mask) {
 }
 
 void swapping() {
+    printf("%s\n", __func__);
     bgh_config_t conf;
     bgh_config_init(&conf);
     conf.starting_rows = 43;
@@ -780,7 +778,7 @@ void swapping() {
     bgh_t *tracker = bgh_config_new(&conf, free_cb);
 
     tracker->active->max_inserts = conf.starting_rows;
-    // Make the thread exit
+    // Make the refresh thread exit
     tracker->running = false;
 
     bgh_key_t key;
@@ -891,6 +889,72 @@ void swapping() {
     bgh_free(tracker);
 }
 
+void refs_honored() {
+    printf("Reference counts handled across refreshes\n", __func__);
+
+    bgh_config_t conf;
+    bgh_config_init(&conf);
+    conf.timeout = 1;
+    conf.refresh_period = 2;
+    bgh_t *tracker = bgh_config_new(&conf, free_cb);
+
+    // Force us to go ahead and have a standby table ready (usually allocated during the first refresh)
+    tracker->standby = bgh_new_tbl(tracker->active->num_rows, 10000, tracker->active->free_cb);
+
+    bgh_key_t key;
+    memset(&key, 0, sizeof(key));
+
+    bgh_data_t *row = bgh_insert_acquire(tracker, &key, strdup("data"));
+    assert(row->ref_count == 2);
+
+    // Wait for the refresh
+    while(!tracker->refreshing) usleep(100);
+    // User error - they insert something new with the same key
+    assert(!bgh_insert_acquire(tracker, &key, (char*)("user error")));
+
+    // the original pointer will be timed out and removed from the table
+    // make sure we can still use it
+    // Wait to stop refreshing
+    while(tracker->refreshing) usleep(100);
+
+    // The tables have swapped out
+    // row is no longer in the active table and we're not refreshing
+    // Wait for another refresh to make sure it's reference is actually
+    // decremented
+
+    while(!tracker->refreshing) usleep(100);
+    while(tracker->refreshing) usleep(100);
+
+    // ref_count decremented since we timed out
+    assert(row->ref_count == 1);
+    bgh_release(tracker, row);
+
+    bgh_free(tracker);
+
+    conf.min_rows = 50047;
+    conf.max_rows = 50047;
+    conf.starting_rows = 50047;
+    tracker = bgh_config_new(&conf, free_cb);
+
+    // XXX Make sure we have a standy table initialized
+    while(!tracker->refreshing) usleep(100);
+    while(tracker->refreshing) usleep(100);
+
+    // Almost the same test as above. Refreshing, but this time not resizing 
+    // table 
+    row = bgh_insert_acquire(tracker, &key, strdup("data"));
+
+    while(!tracker->refreshing) usleep(100);
+    while(tracker->refreshing) usleep(100);
+    while(!tracker->refreshing) usleep(100);
+    while(tracker->refreshing) usleep(100);
+
+    assert(row->ref_count == 1);
+    bgh_release(tracker, row);
+
+    bgh_free(tracker);
+}
+
 int main(int argc, char **argv) {
     // Make rand repeatable
     srand(1);
@@ -902,6 +966,7 @@ int main(int argc, char **argv) {
 
     basic();
     swapping();
+    refs_honored();
     linear_probing();
     primes_test();
     drain();

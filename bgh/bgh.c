@@ -48,11 +48,7 @@ void bgh_randomize_refreshes(bgh_t *b, float pct) {
 }
 
 bgh_data_t *bgh_new_row() {
-    bgh_data_t *row = (bgh_data_t*)calloc(sizeof(bgh_data_t), 1);
-    if(!row)
-        return NULL;
-
-    return row;
+    return (bgh_data_t*)calloc(sizeof(bgh_data_t), 1);
 };
 
 bgh_t *bgh_new(void (*free_cb)(void *)) {
@@ -65,20 +61,20 @@ bgh_t *bgh_new(void (*free_cb)(void *)) {
 void _bgh_free_table(bgh_tbl_t *tbl, bool force) {
     for(int i=0; i<tbl->num_rows; i++) {
         bgh_data_t *r = tbl->rows[i];
-        if(r->user) {
-            if(r->ref_count < 1 || force) {
+
+        if(!r->user)
+            free(r);
+        else { 
+            if(r->ref_count <= 1 || force) {
                 tbl->free_cb(r->user);
                 free(r);
             }
             else {
-                // Will free the row when it's released
-                // Hopefully the user hasn't lost the pointer...
-                r->no_parent_tbl = true;
-                // XXX Not currently used
+                // User best be calling bgh_release appropriately or they'll
+                // have a leak on their hands...
+                r->ref_count--;
             }
         }
-        else
-            free(r);
     }
 
     free(tbl->rows);
@@ -141,22 +137,36 @@ uint64_t _update_size(bgh_config_t *config, int *idx, bgh_tbl_t *tbl) {
     return tbl->num_rows;
 }
 
-static inline void _clear_table(bgh_tbl_t *tbl) {
+static inline bgh_stat_t _clear_table(bgh_tbl_t *tbl) {
     for(int i=0; i<tbl->num_rows; i++) {
         bgh_data_t *r = tbl->rows[i];
+        r->deleted = false;
 
-        if(!r->user || r->ref_count > 0) 
+        // If ref_count > 1 then it will be deleted when user calls 
+        // bgh_release 
+        if(!r->user)
             continue;
 
-        // If ref count > 0, don't delete, just leave in table
-        tbl->free_cb(r->user);
+        if(r->ref_count > 1) {
+            r->ref_count--;
 
+            // XXX We need a clear table, but something is using this row
+            // Alloc a clear row and hope the user didn't screw up
+            if(!(tbl->rows[i] = bgh_new_row()))
+                return BGH_MEM_EXCEPTION;
+            
+            continue;
+        }
+
+        r->ref_count = 0;
+        tbl->free_cb(r->user);
         r->user = NULL;
-        r->deleted = false;
         tbl->inserted--;
     }
 
     tbl->collisions = 0;
+
+    return BGH_OK;
 }
 
 static void *refresh_thread(void *ctx) {
@@ -181,9 +191,18 @@ static void *refresh_thread(void *ctx) {
         // Calc new hash size
         uint64_t nrows = _update_size(&ssns->config, &pindex, ssns->active);
 
-        if(ssns->standby && nrows == ssns->standby->num_rows)
+        if(ssns->standby && nrows == ssns->standby->num_rows) {
             // Just re-use this table
-            _clear_table(ssns->standby);
+            if(_clear_table(ssns->standby) == BGH_MEM_EXCEPTION) {
+                // This is an exceedingly unlikely case
+                // User must be holding a reference to a row after a complete 
+                // refresh and the table must not be getting resized
+                _bgh_free_table(ssns->standby, false);
+                ssns->standby = NULL;
+                // Try to recover at next refresh
+                continue;
+            }
+        }
         else {
             if(ssns->standby) _bgh_free_table(ssns->standby, false);
 
@@ -393,13 +412,15 @@ bgh_data_t *_bgh_insert_table(bgh_tbl_t *tbl, bgh_key_t *key, void *data) {
 
     if(!nrow->user)
         tbl->inserted++;
-    else if(nrow->ref_count < 1)
+    else if(nrow->ref_count == 1)
+        // Ref count is 1
+        // They're overwriting
         tbl->free_cb(nrow->user);
+    else
+        // Something is using it. Treating it as user error!
+        return NULL;
     
-    // else... Ref count is non zero.
-    // Something is using it. Treating it as user error
-
-    nrow->ref_count = 0;
+    nrow->ref_count = 1;
     nrow->deleted = false;
     memcpy(&nrow->key, key, sizeof(nrow->key));
     nrow->user = data;
@@ -422,26 +443,23 @@ bgh_data_t *bgh_insert(bgh_t *tbl, bgh_key_t *key, void *data) {
             bgh_data_t *row = tbl->active->rows[idx];
 
             // If the pointer differs, delete if ref count is < 2
-            // a ref_count of 1 is allowed since that just means we currently
-            // have one in use.. which makes sense
+            // a ref_count of 1 is allowed since that just means we currently 
+            // have one in the table
             //
             // NOTE: this calls the delete callback... user better be done with
             // the old one
-            if(row->user) { 
-                if(row->user != data && row->ref_count < 2) {
+            if(row->user && row->user != data) {
+                if(row->ref_count <= 1) {
                     tbl->active->free_cb(row->user);
                     tbl->active->rows[idx]->user = NULL;
                 }
-                else 
-                // User tried to overwrite old data with something new, but
-                // multiple things held the old data (in terms of ref count)
-                // This is invalid. To prevent crashes, just insert the new
-                // data into the standby table.
-
-                // Any future lookups during the refresh that go to the active 
-                // table first will return the old data. It will then overwrite
-                // the new data in the standby table
-                { }
+                else { 
+                    // User tried to overwrite old data with something new, but
+                    // multiple things held the old data (in terms of ref count)
+                    // This is invalid.
+                    pthread_mutex_unlock(&tbl->lock);
+                    return NULL;
+                }
             }
         }
         bgh_data_t *ret = _bgh_insert_table(tbl->standby, key, data);
@@ -536,27 +554,51 @@ void bgh_release(bgh_t *tbl, bgh_data_t *row) {
     if(!row)
         return;
         
+    // Special case
+    // Row was deleted or cleared while something held the reference
+    // If it was cleared, then the row is technically still in use and should
+    // not yet be deleted
+    if(row->ref_count == 1) {
+        tbl->active->free_cb(row->user);
+        free(row);
+        return;
+    }
+
     row->ref_count--;
+
+    if(row->ref_count > 0)
+        return;
+
+    tbl->active->free_cb(row->user);
+    // XXX Note: technically there is a race here and we might should be 
+    // decrementing this in the standby table. Handling this case would
+    // be more complicated than is warranted, and the problem will fix itself
+    // after the next refresh anyway
+    tbl->active->inserted--;
+    row->user = NULL;
+    row->deleted = true;
+
 }
 
+// NOTE: Treating more or less the same as release
 void bgh_delete_from_table(bgh_tbl_t *tbl, bgh_key_t *key) {
     bgh_data_t *row = _lookup_row(tbl, key);
     if(!row || !row->user) 
         return;
 
-    // XXX Deletes ignore ref_count
-    // Uh oh...
-    //if(row->ref_count >= 2)
-    //    return;
+    // Release decrements the ref_count
+    // If it hits zero the row will be cleared
+    if(row->ref_count > 2) {
+        row->ref_count--;
+        return; 
+    }
 
     tbl->free_cb(row->user);
-
     tbl->inserted--;
     row->user = NULL;
     row->deleted = true;
 }
 
-// XXX Clear ignores ref_count
 void bgh_clear(bgh_t *tbl, bgh_key_t *key) {
     pthread_mutex_lock(&tbl->lock);
     if(tbl->refreshing) {
