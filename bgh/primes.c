@@ -4,7 +4,8 @@
 // http://compoasso.free.fr/primelistweb/page/prime/liste_online_en.php
 
 static uint64_t primes[] = {
-	50047,
+    25013,	
+    50047,
 	100003,
 	200003,
 	300043,

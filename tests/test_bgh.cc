@@ -75,22 +75,22 @@ void primes_test() {
 
     // Limit
     assert(prime_nearest_idx(0) == 0);
-    assert(prime_nearest_idx(50046) == 0);
-    assert(prime_nearest_idx(50047) == 0);
+    assert(prime_nearest_idx(25012) == 0);
+    assert(prime_nearest_idx(25013) == 0);
     // Rounds up
-    assert(prime_nearest_idx(50048) == 1);
-    assert(prime_nearest_idx(100002) == 1);
-    assert(prime_nearest_idx(100004) == 2);
+    assert(prime_nearest_idx(25014) == 1);
+    assert(prime_nearest_idx(100002) == 2);
+    assert(prime_nearest_idx(100004) == 3);
 
-    assert(prime_smaller_idx(0) == 50047);
-    assert(prime_smaller_idx(1) == 50047);
-    assert(prime_larger_idx(1) == 200003);
+    assert(prime_smaller_idx(0) == 25013);
+    assert(prime_smaller_idx(1) == 25013);
+    assert(prime_larger_idx(2) == 200003);
 
-    assert(prime_nearest_idx(16000000) == 26);
-    assert(prime_larger_idx(26) == 17000023);
-    assert(prime_larger_idx(31) == 20000003);
-    // Limit
+    assert(prime_nearest_idx(16000000) == 27);
+    assert(prime_larger_idx(27) == 17000023);
     assert(prime_larger_idx(32) == 20000003);
+    // Limit
+    assert(prime_larger_idx(33) == 20000003);
 }
 
 void basic() {
@@ -931,9 +931,9 @@ void refs_honored() {
 
     bgh_free(tracker);
 
-    conf.min_rows = 50047;
-    conf.max_rows = 50047;
-    conf.starting_rows = 50047;
+    conf.min_rows = 25013;
+    conf.max_rows = 25013;
+    conf.starting_rows = 25013;
     tracker = bgh_config_new(&conf, free_cb);
 
     // XXX Make sure we have a standy table initialized
