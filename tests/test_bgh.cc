@@ -271,6 +271,7 @@ void linear_probing() {
     key2.sport = 4000;
     key2.dport = 3000; 
 
+
     bgh_insert(tracker, &key1, (char*)"foo1");
     bgh_insert(tracker, &key2, (char*)"foo2");
 
@@ -279,15 +280,18 @@ void linear_probing() {
 
     assert(idx1 == idx2-1);
 
-    // Removed. No longer doing "hash healing" due to edge case and low value
-    #if 0
-    // Clear the first one. When we do the next lookup on the collided row, it
-    // will adjust back by one
     bgh_clear(tracker, &key1);
-    idx2 = _lookup_idx(tracker->active, &key2);
-    assert(idx1 == idx2);
-    #endif
+    bgh_clear(tracker, &key2);
 
+    // idx wraps around correctly
+    bzero(&key1, sizeof(key1)); // All zeros will wind up in row[0]
+    bgh_insert(tracker, &key1, (char*)"foo @ zero");
+
+    bzero(&key1, sizeof(key1)); // All zeros will wind up in row[0]
+    bgh_insert(tracker, &key1, (char*)"woulda been 12, then 0");
+    key1.sip = 12; // XXX If hash func changes, this test may be broken 
+    int idx = _lookup_idx(tracker->active, &key1);
+    assert(idx == 1);
     bgh_free(tracker);
 }
 

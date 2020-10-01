@@ -158,8 +158,8 @@ static inline bgh_stat_t _clear_table(bgh_tbl_t *tbl) {
             continue;
         }
 
-        r->ref_count = 0;
         tbl->free_cb(r->user);
+        r->ref_count = 0;
         r->user = NULL;
         tbl->inserted--;
     }
@@ -311,13 +311,14 @@ uint64_t hash_func(uint64_t mask, bgh_key_t *key) {
 }
 
 int64_t _lookup_idx(bgh_tbl_t *table, bgh_key_t *key) {
-    int64_t idx = hash_func(table->num_rows, key);
+    uint64_t idx = hash_func(table->num_rows, key);
     bgh_data_t *row = table->rows[idx];
 
     // If nothing is/was stored here, just return it anyway.
     // We'll check later
     // The check for "deleted" is to deal with the case where there was 
-    // previously a collision
+    // previously a collision. We still need to be able to find the collided 
+    // row
     if((!row->user && !row->deleted) || key_eq(key, &row->key))
         return idx;
 
@@ -329,16 +330,17 @@ int64_t _lookup_idx(bgh_tbl_t *table, bgh_key_t *key) {
     //  - "deleted" is used to handle that case
 
     uint64_t collisions = 0;
-    uint64_t start = idx++;
-    while(idx != start) {
-        collisions++;
+    uint64_t start = idx;
 
-        //printf("%llu vs %llu\n", 
-        //        hash_func(table->num_rows, &table->rows[start]->key),
-        //        hash_func(table->num_rows, key));
+    while(1) { 
+        idx++;
+        collisions++;
 
         if(idx >= table->num_rows)
             idx = 0;
+
+        if(idx == start)
+            return -1;
 
         bgh_data_t *row = table->rows[idx];
 
@@ -352,15 +354,13 @@ int64_t _lookup_idx(bgh_tbl_t *table, bgh_key_t *key) {
             table->collisions += collisions;
             return idx;
         }
-
-        idx++;
     }
 
     return -1;
 }
 
 bgh_data_t *_lookup_row(bgh_tbl_t *table, bgh_key_t *key) {
-    int64_t idx = hash_func(table->num_rows, key);
+    uint64_t idx = hash_func(table->num_rows, key);
     bgh_data_t *row = table->rows[idx];
 
     if(key_eq(key, &row->key))
@@ -373,10 +373,16 @@ bgh_data_t *_lookup_row(bgh_tbl_t *table, bgh_key_t *key) {
     if(!row->user && !row->deleted)
         return row;
 
-    uint64_t start = idx++;
-    while(idx != start) {
+    uint64_t start = idx;
+
+    while(1) {
+        idx++;
+
         if(idx >= table->num_rows)
             idx = 0;
+
+        if(idx == start)
+            return NULL;
 
         bgh_data_t *row = table->rows[idx];
 
@@ -389,8 +395,6 @@ bgh_data_t *_lookup_row(bgh_tbl_t *table, bgh_key_t *key) {
         if(!row->user && !row->deleted) {
             return row;
         }
-
-        idx++;
     }
 
     return NULL;
@@ -452,6 +456,8 @@ bgh_data_t *bgh_insert(bgh_t *tbl, bgh_key_t *key, void *data) {
                 if(row->ref_count <= 1) {
                     tbl->active->free_cb(row->user);
                     tbl->active->rows[idx]->user = NULL;
+                    row->ref_count = 0;
+                    row->deleted = true;
                 }
                 else { 
                     // User tried to overwrite old data with something new, but
@@ -577,7 +583,6 @@ void bgh_release(bgh_t *tbl, bgh_data_t *row) {
     tbl->active->inserted--;
     row->user = NULL;
     row->deleted = true;
-
 }
 
 // NOTE: Treating more or less the same as release
@@ -595,6 +600,7 @@ void bgh_delete_from_table(bgh_tbl_t *tbl, bgh_key_t *key) {
 
     tbl->free_cb(row->user);
     tbl->inserted--;
+    row->ref_count = 0;
     row->user = NULL;
     row->deleted = true;
 }
