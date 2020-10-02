@@ -56,9 +56,7 @@ typedef struct _bgh_data_t {
     int ref_count;
     // Necessary to prevent drained or deleted rows from preventing lookups 
     // from working when there had been a collision
-    bool deleted,
-         no_parent_tbl;
-    // pthread_mutex_t release_lock;
+    bool deleted;
     bgh_key_t key;
 } bgh_data_t;
 

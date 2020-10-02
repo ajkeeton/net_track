@@ -17,10 +17,10 @@ bgh_data_t *_draining_lookup_active(
 bgh_data_t *_draining_prefer_standby(
         bgh_tbl_t *active, bgh_tbl_t *standby, bgh_key_t *key);
 bgh_stat_t _bgh_insert_table(bgh_tbl_t *tbl, bgh_key_t *key, void *data);
+void _bgh_free_table(bgh_tbl_t *tbl, bool force);
 int64_t _lookup_idx(bgh_tbl_t *table, bgh_key_t *key);
 bgh_tbl_t 
 *bgh_new_tbl(uint64_t rows, uint64_t max_inserts, void (*free_cb)(void *));
-void bgh_free_table(bgh_tbl_t *tbl);
 int prime_total();
 uint64_t prime_at_idx(int idx);
 int prime_nearest_idx(uint64_t val);
@@ -61,10 +61,12 @@ void assert_lookup_clear(bgh_tbl_t *t, bgh_key_t *key) {
 }
 
 void assert_refresh_within(bgh_t *b, int seconds) {
+
     time_t start = time(NULL);
 
     while(!b->refreshing) {
         assert(time(NULL) - start <= seconds);
+        usleep(1);
     }
 }
 
@@ -73,22 +75,22 @@ void primes_test() {
 
     // Limit
     assert(prime_nearest_idx(0) == 0);
-    assert(prime_nearest_idx(50046) == 0);
-    assert(prime_nearest_idx(50047) == 0);
+    assert(prime_nearest_idx(25012) == 0);
+    assert(prime_nearest_idx(25013) == 0);
     // Rounds up
-    assert(prime_nearest_idx(50048) == 1);
-    assert(prime_nearest_idx(100002) == 1);
-    assert(prime_nearest_idx(100004) == 2);
+    assert(prime_nearest_idx(25014) == 1);
+    assert(prime_nearest_idx(100002) == 2);
+    assert(prime_nearest_idx(100004) == 3);
 
-    assert(prime_smaller_idx(0) == 50047);
-    assert(prime_smaller_idx(1) == 50047);
-    assert(prime_larger_idx(1) == 200003);
+    assert(prime_smaller_idx(0) == 25013);
+    assert(prime_smaller_idx(1) == 25013);
+    assert(prime_larger_idx(2) == 200003);
 
-    assert(prime_nearest_idx(16000000) == 26);
-    assert(prime_larger_idx(26) == 17000023);
-    assert(prime_larger_idx(31) == 20000003);
-    // Limit
+    assert(prime_nearest_idx(16000000) == 27);
+    assert(prime_larger_idx(27) == 17000023);
     assert(prime_larger_idx(32) == 20000003);
+    // Limit
+    assert(prime_larger_idx(33) == 20000003);
 }
 
 void basic() {
@@ -125,9 +127,9 @@ void basic() {
     key.sip = 20;
     assert_lookup_eq(tracker, key, "bar");
     
-        key.sip = 30;
-        assert_lookup_eq(tracker, key, "baz");
-        key.sip = 20;
+    key.sip = 30;
+    assert_lookup_eq(tracker, key, "baz");
+    key.sip = 20;
 
     // Overwrite    
     bgh_insert(tracker, &key, strdup("foobazzybar"));
@@ -175,7 +177,7 @@ void timeouts() {
     bgh_config_init(&conf);
     conf.timeout = 1;
     conf.starting_rows = 31;
-    conf.refresh_period = 2;
+    conf.refresh_period = 3;
 
     bgh_t *tracker = bgh_config_new(&conf, free_cb);
 
@@ -195,7 +197,7 @@ void timeouts() {
     bgh_insert(tracker, &key, strdup("bar"));
 
     // wait for refresh to start
-    assert_refresh_within(tracker, 2);
+    assert_refresh_within(tracker, 4);
 
     // Make sure we still have both 
     assert(tracker->active->inserted == 2);
@@ -203,7 +205,7 @@ void timeouts() {
     // Table is draining.
     // Let "1" expire, lookup "2" (thereby refreshing it), and insert "3"
     // Wait .5 seconds
-    usleep(500000);
+    usleep(750000);
     assert(tracker->refreshing);
     assert(tracker->active->inserted == 2);
     assert(tracker->standby->inserted == 0);
@@ -269,6 +271,7 @@ void linear_probing() {
     key2.sport = 4000;
     key2.dport = 3000; 
 
+
     bgh_insert(tracker, &key1, (char*)"foo1");
     bgh_insert(tracker, &key2, (char*)"foo2");
 
@@ -277,15 +280,18 @@ void linear_probing() {
 
     assert(idx1 == idx2-1);
 
-    // Removed. No longer doing "hash healing" due to edge case and low value
-    #if 0
-    // Clear the first one. When we do the next lookup on the collided row, it
-    // will adjust back by one
     bgh_clear(tracker, &key1);
-    idx2 = _lookup_idx(tracker->active, &key2);
-    assert(idx1 == idx2);
-    #endif
+    bgh_clear(tracker, &key2);
 
+    // idx wraps around correctly
+    bzero(&key1, sizeof(key1)); // All zeros will wind up in row[0]
+    bgh_insert(tracker, &key1, (char*)"foo @ zero");
+
+    bzero(&key1, sizeof(key1)); // All zeros will wind up in row[0]
+    bgh_insert(tracker, &key1, (char*)"woulda been 12, then 0");
+    key1.sip = 12; // XXX If hash func changes, this test may be broken 
+    int idx = _lookup_idx(tracker->active, &key1);
+    assert(idx == 1);
     bgh_free(tracker);
 }
 
@@ -554,6 +560,54 @@ void resize() {
     bgh_free(tracker);
 }
 
+void resize_non_zero_refs() {
+    printf("%s\n", __func__);
+
+    bgh_config_t conf;
+    bgh_config_init(&conf);
+    conf.starting_rows = 100003;
+    conf.refresh_period = 2;
+    conf.timeout = 1;
+
+    bgh_t *tracker = bgh_config_new(&conf, free_cb);
+    bgh_key_t key;
+    // Bzero'ing to clean up pad bytes and prevent valgrind from complaining
+    bzero(&key, sizeof(key)); 
+    key.sip = 1;
+    
+    bgh_data_t *data = bgh_insert_acquire(tracker, &key, (void*)strdup("foo"));
+    assert(data && data->user);
+
+    // Get to mid-refresh
+    usleep(2500000);
+    assert(tracker->refreshing);
+
+    key.sip = 2;
+    bgh_data_t *data2 = bgh_insert_acquire(tracker, &key, strdup("foo2"));
+    assert(data2 && data2->user);
+
+    //usleep(6000000);
+    //assert(!tracker->refreshing);
+    while(tracker->refreshing) {
+        usleep(100000);
+        puts(".");
+    }
+
+    assert_lookup_eq(tracker, key, "foo2");
+    key.sip = 1;
+    assert(!bgh_acquire(tracker, &key));
+    assert(data && data->user);
+
+    bgh_release(tracker, data);
+
+    while(!tracker->refreshing) {
+        usleep(100000);
+        puts(".");
+    }
+
+    bgh_free(tracker);
+}
+
 std::vector<bgh_key_t> keys;
 
 bgh_key_t gen_rand_key() {
@@ -720,6 +774,7 @@ bgh_key_t find_collision(bgh_key_t src, uint64_t mask) {
 }
 
 void swapping() {
+    printf("%s\n", __func__);
     bgh_config_t conf;
     bgh_config_init(&conf);
     conf.starting_rows = 43;
@@ -727,7 +782,7 @@ void swapping() {
     bgh_t *tracker = bgh_config_new(&conf, free_cb);
 
     tracker->active->max_inserts = conf.starting_rows;
-    // Make the thread exit
+    // Make the refresh thread exit
     tracker->running = false;
 
     bgh_key_t key;
@@ -832,8 +887,74 @@ void swapping() {
     assert_lookup_eq(tracker, key, "data 4");
     assert_lookup_eq(tracker, key2, "data 4.5");
 
-    bgh_free_table(standby);
+    _bgh_free_table(standby, false);
     tracker->standby = NULL;
+
+    bgh_free(tracker);
+}
+
+void refs_honored() {
+    printf("Reference counts handled across refreshes\n", __func__);
+
+    bgh_config_t conf;
+    bgh_config_init(&conf);
+    conf.timeout = 1;
+    conf.refresh_period = 2;
+    bgh_t *tracker = bgh_config_new(&conf, free_cb);
+
+    // Force us to go ahead and have a standby table ready (usually allocated during the first refresh)
+    tracker->standby = bgh_new_tbl(tracker->active->num_rows, 10000, tracker->active->free_cb);
+
+    bgh_key_t key;
+    memset(&key, 0, sizeof(key));
+
+    bgh_data_t *row = bgh_insert_acquire(tracker, &key, strdup("data"));
+    assert(row->ref_count == 2);
+
+    // Wait for the refresh
+    while(!tracker->refreshing) usleep(100);
+    // User error - they insert something new with the same key
+    assert(!bgh_insert_acquire(tracker, &key, (char*)("user error")));
+
+    // the original pointer will be timed out and removed from the table
+    // make sure we can still use it
+    // Wait to stop refreshing
+    while(tracker->refreshing) usleep(100);
+
+    // The tables have swapped out
+    // row is no longer in the active table and we're not refreshing
+    // Wait for another refresh to make sure it's reference is actually
+    // decremented
+
+    while(!tracker->refreshing) usleep(100);
+    while(tracker->refreshing) usleep(100);
+
+    // ref_count decremented since we timed out
+    assert(row->ref_count == 1);
+    bgh_release(tracker, row);
+
+    bgh_free(tracker);
+
+    conf.min_rows = 25013;
+    conf.max_rows = 25013;
+    conf.starting_rows = 25013;
+    tracker = bgh_config_new(&conf, free_cb);
+
+    // XXX Make sure we have a standy table initialized
+    while(!tracker->refreshing) usleep(100);
+    while(tracker->refreshing) usleep(100);
+
+    // Almost the same test as above. Refreshing, but this time not resizing 
+    // table 
+    row = bgh_insert_acquire(tracker, &key, strdup("data"));
+
+    while(!tracker->refreshing) usleep(100);
+    while(tracker->refreshing) usleep(100);
+    while(!tracker->refreshing) usleep(100);
+    while(tracker->refreshing) usleep(100);
+
+    assert(row->ref_count == 1);
+    bgh_release(tracker, row);
 
     bgh_free(tracker);
 }
@@ -846,12 +967,15 @@ int main(int argc, char **argv) {
         stress();
         return 0;
     }
+
     basic();
     swapping();
+    refs_honored();
     linear_probing();
     primes_test();
     drain();
     resize();
+    resize_non_zero_refs();
     time_draining();
     timeouts();
     bench();
