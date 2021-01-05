@@ -120,7 +120,7 @@ uint64_t _update_size(bgh_config_t *config, int *idx, bgh_tbl_t *tbl) {
     uint64_t next = 0;
     if(config->scale_up_pct > 0 && (tbl->inserted > tbl->num_rows * config->scale_up_pct/100.0)) {
         next = prime_larger_idx(*idx);
-        if(next > config->max_rows)
+        if(next >= config->max_rows)
             return config->max_rows;
         (*idx)++;
         return next;
@@ -128,7 +128,7 @@ uint64_t _update_size(bgh_config_t *config, int *idx, bgh_tbl_t *tbl) {
 
     if(tbl->inserted < tbl->num_rows * config->scale_down_pct/100.0) {
         next = prime_smaller_idx(*idx);
-        if(next < config->min_rows)
+        if(next <= config->min_rows)
             return config->min_rows;
         (*idx)--;
         return next;
@@ -180,7 +180,7 @@ static void *refresh_thread(void *ctx) {
 
         // See if we should begin building a new table yet
         if(now - last < ssns->config.refresh_period) {
-            usleep(50000); // 50 ms
+            usleep(100000); // 100 ms
             continue;
         }
 
@@ -224,8 +224,9 @@ static void *refresh_thread(void *ctx) {
         time_t tos = time(NULL);
         while(time(NULL) - tos < ssns->config.timeout) {
             // Make sure we don't hold up any shutdowns
-            if(!ssns->running) return NULL;
-            usleep(10000);
+            if(!ssns->running)
+                break;
+            usleep(100000);
         }
 
         bgh_tbl_t *old = ssns->active;
@@ -268,7 +269,7 @@ bgh_t *bgh_config_new(bgh_config_t *config, void (*free_cb)(void *)) {
         // We failed to create a thread. Should never be able to reach this
         // case....
         _bgh_free_table(table->active, true);
-        pthread_mutex_destroy(&table->lock, NULL);
+        pthread_mutex_destroy(&table->lock);
         free(table);
         return NULL;
     }
