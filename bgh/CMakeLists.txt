@@ -7,6 +7,6 @@ else()
     target_link_libraries(bgh pthread)
 endif()
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -std=c99 -fPIC -Wall -O2")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -std=c99 -fPIC -Wall -O0 -g")
 install(TARGETS bgh ARCHIVE DESTINATION /usr/local/lib)
 install(FILES bgh.h DESTINATION /usr/local/include)

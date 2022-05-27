@@ -284,11 +284,13 @@ void bgh_free(bgh_t *tbl) {
 
     tbl->running = false;
     pthread_join(tbl->refresh, NULL);
-    pthread_mutex_destroy(&tbl->lock);
 
+    pthread_mutex_lock(&tbl->lock);
     _bgh_free_table(tbl->active, true);
     if(tbl->standby)
         _bgh_free_table(tbl->standby, true);
+    pthread_mutex_unlock(&tbl->lock);
+    pthread_mutex_destroy(&tbl->lock);
     free(tbl);
 }
 
