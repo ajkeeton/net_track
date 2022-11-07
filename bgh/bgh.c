@@ -87,7 +87,7 @@ bgh_tbl_t *bgh_new_tbl(uint64_t rows, uint64_t max_inserts, void (*free_cb)(void
         return NULL;
 
     tbl->num_rows = rows;
-    tbl->rows = (bgh_data_t**)malloc(sizeof(bgh_data_t) * tbl->num_rows);
+    tbl->rows = (bgh_data_t**)malloc(sizeof(bgh_data_t*) * tbl->num_rows);
 
     if(!tbl->rows) {
         free(tbl);
@@ -274,7 +274,7 @@ bgh_t *bgh_config_new(bgh_config_t *config, void (*free_cb)(void *)) {
         return NULL;
     }
 
-    pthread_setname_np(table->refresh, "bgh_refresh");
+    pthread_setname_np("bgh_refresh");
 
     return table;
 }
