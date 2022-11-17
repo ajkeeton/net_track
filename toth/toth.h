@@ -38,13 +38,10 @@ typedef struct _toth_stats_t {
 
 typedef struct _toth_config_t {
     uint64_t starting_rows,
-             min_rows,
-             max_rows,
              timeout;
     float hash_full_pct,
           scale_up_pct,
           scale_down_pct;
-
     uint8_t timeout_tables, 
             max_col_per_row;
 } toth_config_t;
@@ -76,9 +73,6 @@ typedef struct _toth_to_node_t {
     // Index into the data table
     toth_data_t *data;
 
-    // If there was a collision this will be set to the collided node
-    // toth_data_t *col;
-
     int32_t next,
             prev;
 } toth_to_node_t;
@@ -92,7 +86,7 @@ typedef struct _toth_to_tbl_t {
 } toth_to_tbl_t;
 
 typedef struct _toth_t {
-    toth_config_t config;
+    toth_config_t conf;
 
     // The callback to clean up user data
     void (*free_cb)(void *);
@@ -101,19 +95,14 @@ typedef struct _toth_t {
     // "collisions" is considered when resizing the next hash
     uint64_t inserted, 
              collisions,
-             max_inserts,
-             timeout,
-             timeout_swap,
              num_rows,
-             to_last_swap,
-             to_last,
-             max_col_per_row;
+             max_inserts,
+             to_last;
 
     // The hash table for user data
     toth_data_t **rows;
 
     // The timeout tables
-    uint32_t to_num_tables;
     uint32_t to_active;
     toth_to_tbl_t **tos;
 } toth_t;
@@ -152,16 +141,17 @@ void toth_remove(toth_t *tracker, toth_key_t *key);
 // Populate given stats structure
 void toth_get_stats(toth_t *tracker, toth_stats_t *stats);
 
+// Force timeout code to execute rather than waiting for the next insert
 void toth_do_timeouts(toth_t *tracker);
 
+// Force a resize table to resize. New size is determined by current hash usage 
 void toth_do_resize(toth_t *tracker);
 
 // Apply a random offset to the refresh and refresh timeout 
-// This prevents timing attacks and helps performance when BGH is used in a 
-// large number of parallel threads
+// This prevents timing attacks and helps performance when several instances
+// are used in parallel
 //
-// Argument is a percentage applied to the current settings.
-// Can be called repeatedly to re-randomize the the settings
+// Argument is a percentage applied to the current settings
 void toth_randomize_refreshes(toth_t *tracker, float pct);
 
 #ifdef __cplusplus

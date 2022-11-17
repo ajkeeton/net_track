@@ -4,7 +4,11 @@
 
 #include "to.h"
 
-uint64_t time_ns();
+uint64_t time_ns() {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec * 1000000000 + now.tv_nsec;
+}
 
 void _toth_data_clear(toth_t *tbl, toth_data_t *row) {
     tbl->free_cb(row->user);
@@ -18,15 +22,15 @@ void _toth_data_clear(toth_t *tbl, toth_data_t *row) {
         if(n)
             n->prev = p;
         free(row);
-        //tbl->collisions--;
+        tbl->collisions--;
     }
     else if(n) {
         // No prev. We're the head
         // Promote next
-        uint32_t idx = hash_func(tbl->num_rows, &row->key);
+        uint64_t idx = hash_func(tbl->num_rows, &row->key);
         tbl->rows[idx] = n;
         n->prev = NULL;
-        //tbl->collisions--;
+        tbl->collisions--;
         free(row);
     }
     else 
@@ -103,7 +107,8 @@ int32_t _to_append(toth_to_tbl_t *tbl, toth_data_t *d) {
 }
 
 toth_to_tbl_t *_toth_get_oldest_table(toth_t *tbl) {
-    return tbl->to_active+1 < tbl->to_num_tables ? tbl->tos[tbl->to_active+1] : tbl->tos[0];
+    return tbl->to_active+1 < tbl->conf.timeout_tables ? 
+        tbl->tos[tbl->to_active+1] : tbl->tos[0];
 }
 
 toth_to_tbl_t *_tot_get_active(toth_t *tbl) {
@@ -123,48 +128,27 @@ toth_stat_t tot_insert(toth_t *tbl, toth_data_t *row) {
 void tot_remove(toth_t *tbl, toth_data_t *d) {
     //printf("- Clearing node %p / %s using table %d\n", d, (char*)d->user, d->to_tbl);
     _to_unlink(tbl->tos[d->to_tbl], d->to_idx);
-
-    #if 0
-    // int didx = hash_func(tbl->num_rows, &d->key);
-
-    for(int i=0; i<tbl->to_num_tables; i++) {
-        toth_to_tbl_t *t = tbl->tos[i];
-        assert(t->head != didx);
-        assert(t->tail != didx);
-        
-        int cidx = t->head;
-        while(cidx != -1) {
-            toth_to_node_t *node = &t->tos[cidx];
-            assert(node->data != d);
-            cidx = node->next;
-        }
-    }
-    #endif
-
     _toth_data_clear(tbl, d);
  }
 
 // Move timeout to the active table
-toth_stat_t _to_move(toth_t *tbl, toth_to_tbl_t *old, toth_data_t *row) {
-    toth_to_tbl_t *tot = _tot_get_active(tbl);      
-    if(tot->inserts + 1 >= tot->num_rows)
-        return TOTH_MEM_EXCEPTION;
-
-    // Unlink in old table
-    _to_unlink(old, row->to_idx);
-
-    row->to_idx = _to_append(tot, row);
-    row->to_tbl = tbl->to_active;
-    return TOTH_OK;
+void _to_move(toth_to_tbl_t *to, toth_to_tbl_t *from, uint8_t tidx, toth_data_t *row) {
+    _to_unlink(from, row->to_idx);
+    row->to_idx = _to_append(to, row);
+    row->to_tbl = tidx;
 }
 
 toth_stat_t tot_refresh(toth_t *tbl, toth_data_t *row) {
     if(row->to_tbl == tbl->to_active)
         return TOTH_OK;
 
-    if(_to_move(tbl, tbl->tos[row->to_tbl], row) != TOTH_OK)
+    toth_to_tbl_t *tot = _tot_get_active(tbl);
+    // Make sure destination table has room   
+    if(tot->inserts + 1 >= tot->num_rows)
         return TOTH_MEM_EXCEPTION;
-    
+
+    _to_move(tot, tbl->tos[row->to_tbl], tbl->to_active, row);
+
     // printf("Moved %s from %d to %d (%p)\n", (char*)row->user, row->to_tbl, tbl->to_active, current);
     return TOTH_OK;
 }
@@ -172,6 +156,7 @@ toth_stat_t tot_refresh(toth_t *tbl, toth_data_t *row) {
 void _to_clear_table(toth_t *tbl, toth_to_tbl_t *tot) {
     int32_t i = tot->head;
 
+    // uint64_t start = tbl->inserted;
     while(i >= 0) {
         toth_to_node_t *to = &tot->tos[i];    
         toth_data_t *d = to->data;
@@ -183,32 +168,64 @@ void _to_clear_table(toth_t *tbl, toth_to_tbl_t *tot) {
             d->prev->next = d->next;
             // this was a collision. free here
             free(d);
+            tbl->collisions--;
         }
         else {
             d->user = NULL;
         }
         
+        tbl->inserted--;
         i = to->next;
         to->prev = -1;
         to->next = -1;
     }
 
+    // printf("Timedout %lu\n", start - tbl->inserted);
     tot->head = tot->tail = -1;
     tot->inserts = 0;
+}
+
+void tot_copy(toth_t *dtbl, toth_t *ftbl) {
+    toth_to_tbl_t *to = dtbl->tos[dtbl->to_active];
+
+    // Cleanup first
+    tot_do_timeouts(ftbl);
+
+    for(int i=0; i < ftbl->conf.timeout_tables; i++) {
+        toth_to_tbl_t *from = ftbl->tos[i];
+        int32_t i = from->head;
+
+        while(i >= 0) {
+            // Shouldn't happen but just in case...
+            if(to->inserts+1 >= to->num_rows)
+                return;
+
+            toth_to_node_t *ton = &from->tos[i];    
+            toth_data_t *d = ton->data;
+    
+            _to_unlink(from, d->to_idx);
+            if(toth_insert(dtbl, &d->key, d->user) != TOTH_OK)
+                return;
+
+            d->user = NULL;
+        }
+
+        from->head = -1;
+    }
 }
 
 // Purge oldest table if enough time has passed
 void tot_do_timeouts(toth_t *tbl) {
     uint64_t t = time_ns();
 
-    if((t - tbl->to_last) < tbl->timeout) {
+    if((t - tbl->to_last) < tbl->conf.timeout) {
         // puts("too early to time out");
         return;
     }
 
     tbl->to_last = t;
 
-    tbl->to_active = tbl->to_active+1 < tbl->to_num_tables ? tbl->to_active+1 : 0;
+    tbl->to_active = tbl->to_active+1 < tbl->conf.timeout_tables ? tbl->to_active+1 : 0;
 
     // printf("Timing out tbl %p (%d)\n", to_tbl, tbl->to_active);
     _to_clear_table(tbl, _tot_get_active(tbl));
@@ -216,13 +233,13 @@ void tot_do_timeouts(toth_t *tbl) {
 
 void tot_new(toth_t *tbl) {
     tbl->to_active = 0;
-    tbl->tos = (toth_to_tbl_t **)calloc(sizeof(toth_to_tbl_t *), tbl->to_num_tables);
+    tbl->tos = (toth_to_tbl_t **)calloc(sizeof(toth_to_tbl_t *), tbl->conf.timeout_tables);
     if(!tbl->tos) {
         // XXX
         abort();
     }
 
-    for(int i=0; i < tbl->to_num_tables; i++) {
+    for(int i=0; i < tbl->conf.timeout_tables; i++) {
         tbl->tos[i] = _to_new_tbl(tbl->max_inserts);
         if(!tbl->tos[i])
             // XXX
@@ -230,12 +247,10 @@ void tot_new(toth_t *tbl) {
     }
 
     tbl->to_last = time_ns();
-    tbl->to_last_swap = tbl->to_last;
-    tbl->timeout_swap = tbl->timeout / tbl->to_num_tables;
 }
 
 void tot_free(toth_t *tbl) {
-    for(int i=0; i<tbl->to_num_tables; i++) {
+    for(int i=0; i<tbl->conf.timeout_tables; i++) {
         toth_to_tbl_t *tot = tbl->tos[i];
 
         //printf("\nFreeing table %d\n", to_idx);

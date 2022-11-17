@@ -15,6 +15,7 @@ extern "C" {
 toth_data_t *_insert_coll(
         toth_data_t *parent, toth_key_t *key, void *data);
 void tot_do_timeouts(toth_t *tbl);
+uint64_t time_ns();
 }
 
 void free_cb(void *p) {
@@ -127,7 +128,7 @@ void timeouts() {
 
     toth_t *tracker = toth_config_new(&conf, free_cb);
 
-    tracker->timeout = 500000;
+    tracker->conf.timeout = 500000;
 
     toth_key_t key;
     // Bzero'ing to clean up pad bytes and prevent valgrind from complaining
@@ -240,26 +241,20 @@ void collisions() {
     }
 
     // Clear every third 
-    for(int i=0; i < num; i++) {
-        if(!(num % 3)) {
-            toth_remove(tracker, &keys[i]);
-            assert_lookup_eq(tracker, keys[i], NULL);
-        }
+    for(int i=0; i < num; i += 3) {
+        toth_remove(tracker, &keys[i]);
+        assert_lookup_eq(tracker, keys[i], NULL);
     }
 
     // Re-check
     for(int i=0; i < num; i++) {
         char buf[8];
         sprintf(buf, "%d", i);
-        if(!(num % 3))
+        if(!(i % 3))
             assert_lookup_eq(tracker, keys[i], NULL);
         else
             assert_lookup_eq(tracker, keys[i], buf);
     }
-
-    // force timeouts
-    //tracker->timeout = 0;
-    //tot_do_timeouts(tracker);
 
     toth_free(tracker);
 }
@@ -359,7 +354,7 @@ void bench() {
 
     gettimeofday(&tv, NULL);
     fin = 1000000 * tv.tv_sec + tv.tv_usec;
-    printf("STL map (*no timeout handling*): %f ms\n", float((fin - now))/1000);
+    printf("STL map *with no timeout handling*: %f ms\n", float((fin - now))/1000);
 }
 
 void resize() {
@@ -418,23 +413,8 @@ toth_key_t get_rand_key() {
     return keys[rand() % keys.size()];
 }
 
-static int64_t inline nanos_total(struct timespec *start) {
-    static struct timespec end, ret;
-    clock_gettime(CLOCK_MONOTONIC, &end);
-
-    if ((end.tv_nsec - start->tv_nsec) < 0) {
-        ret.tv_sec = end.tv_sec - start->tv_sec - 1;
-        ret.tv_nsec = 1000000000 + end.tv_nsec - start->tv_nsec;
-    } else {
-        ret.tv_sec = end.tv_sec - start->tv_sec;
-        ret.tv_nsec = end.tv_nsec - start->tv_nsec;
-    }
-
-    return (uint64_t)ret.tv_sec * 1000000000L + ret.tv_nsec;
-}
-
 #define INIT_NUM_ROWS 600101
-#define NUM_KEYS 1024*512
+#define NUM_KEYS 1024*256
 #define TEST_LENGTH 60*5
 
 void stress() {
@@ -462,8 +442,8 @@ void stress() {
              lookup_count = 1, // hack to avoid /0 with first stat update
              insert_total_time = 0,
              insert_count = 1, // hack for first stat update
-             iteration = 0;
-    struct timespec tstart;
+             iteration = 0,
+             tstart = 0;
 
     while(1) {
         toth_key_t key;
@@ -478,6 +458,7 @@ void stress() {
             printf("\n%lus, iteration %llu. Simulating %d sessions\n",
                     time(NULL) - start, iteration, sessions_max);
             printf("- inserted:       %llu\n", stats.inserted);
+            printf("- lookups:        %llu\n", lookup_count);
             printf("- collisions:     %llu\n", stats.collisions);
             printf("- table size:     %llu\n", stats.num_rows);
             printf("- failed inserts: %llu\n", failed_insert);
@@ -494,6 +475,7 @@ void stress() {
             insert_total_time = 0;
             insert_count  = 1;
 
+            puts("Randomizing timeout (5%)");
             toth_randomize_refreshes(tracker, 5);
         }
 
@@ -512,13 +494,13 @@ void stress() {
             key = get_rand_key();
             void *d = strdup("data");
 
-            clock_gettime(CLOCK_MONOTONIC, &tstart);
+            tstart = time_ns();
             if(toth_insert(tracker, &key, d) != TOTH_OK) {
                 failed_insert++;
                 free(d);
             }
             else {
-                insert_total_time += nanos_total(&tstart);
+                insert_total_time += time_ns() - tstart;
                 insert_count++;
             }
         }
@@ -526,9 +508,9 @@ void stress() {
         // Lookup
         if(!(rand() % 2)) {
             key = keys[rand() % keys.size()];
-            clock_gettime(CLOCK_MONOTONIC, &tstart);
+            tstart = time_ns();
             toth_release(tracker, toth_acquire(tracker, &key));
-            lookup_total_time += nanos_total(&tstart);
+            lookup_total_time += time_ns() - tstart;
             lookup_count++;
             // assert_eq(toth_lookup(tracker, &key), "data");
         }
@@ -539,7 +521,7 @@ void stress() {
             toth_remove(tracker, &key);
         }
 
-        // Replace a key. The old session will timeout
+        // Replace a key. Hack to force an old session to timeout
         if(!(rand() % 20)) {
             keys[rand() % sessions_max] = gen_rand_key();
         }

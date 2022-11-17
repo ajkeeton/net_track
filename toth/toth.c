@@ -14,18 +14,10 @@
 #include "primes.h"
 #include "to.h"
 
-uint64_t time_ns() {
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    return now.tv_sec * 1000000000 + now.tv_nsec;
-}
-
 void toth_config_init(toth_config_t *config) {
     int len = prime_total();
 
     config->starting_rows = prime_at_idx(len/3); 
-    config->min_rows = prime_at_idx(0);
-    config->max_rows = prime_at_idx(len);
     config->timeout = TOTH_DEFAULT_TIMEOUT;
     config->hash_full_pct = TOTH_DEFAULT_HASH_FULL_PCT;
 
@@ -79,9 +71,9 @@ toth_t *toth_new_tbl(uint64_t rows, uint64_t max_inserts, void (*free_cb)(void *
     tbl->free_cb = free_cb;
     tbl->inserted = tbl->collisions = 0;
     tbl->max_inserts = max_inserts;
-    tbl->timeout = ((uint64_t)TOTH_DEFAULT_TIMEOUT) * 100000000;
+    tbl->conf.timeout = ((uint64_t)TOTH_DEFAULT_TIMEOUT) * 100000000;
+    tbl->conf.timeout_tables = TOTH_DEFAULT_TIMEOUT_TABLES;
 
-    tbl->to_num_tables = TOTH_DEFAULT_TIMEOUT_TABLES;
     tot_new(tbl);
 
     return tbl;
@@ -96,17 +88,19 @@ toth_t *toth_config_new(toth_config_t *config, void (*free_cb)(void *)) {
     if(!t)
         return NULL;
 
-    t->timeout = config->timeout * 1000000000;
-    t->timeout_swap = t->timeout / t->to_num_tables;
-    
-    if(t->to_num_tables != config->timeout_tables) {
+    if(t->conf.timeout_tables < 2)
+        t->conf.timeout_tables = 2;
+
+    t->conf.timeout = config->timeout * 1000000000 / (t->conf.timeout_tables - 1);
+
+    if(t->conf.timeout_tables != config->timeout_tables) {
         // just re-init to correct size
         tot_free(t);
-        t->to_num_tables = config->timeout_tables;
+        t->conf.timeout_tables = config->timeout_tables;
         tot_new(t);
     }
 
-    t->max_col_per_row = config->max_col_per_row;
+    t->conf.max_col_per_row = config->max_col_per_row;
     return t;
 }
 
@@ -114,19 +108,11 @@ void toth_free(toth_t *tbl) {
     if(!tbl) 
         return;
 
-    // NOTE: The timeout code clears all the user data
+    // NOTE: The timeout code clears all the user data and will cleanup collisions
     tot_free(tbl);
 
     for(int i=0; i<tbl->num_rows; i++) {
         free(tbl->rows[i]);
-        //toth_data_t *row = tbl->rows[i],
-        //            *next = tbl->rows[i]->next,
-        //            *nn = NULL;
-        //while(next) {
-        //    nn = next->next;
-        //    free(next);
-        //    next = nn;
-        //}
     }
 
     free(tbl->rows);
@@ -165,11 +151,9 @@ uint64_t hash_func(uint64_t mask, toth_key_t *key) {
 }
 
 toth_data_t *_lookup(   
-        toth_t *tbl, toth_key_t *key, uint32_t *idx, uint8_t *col_idx, 
-        bool alloc_on_collision) {
-    *idx = hash_func(tbl->num_rows, key);
-    toth_data_t *row = tbl->rows[*idx];
-    *col_idx = 0;
+        toth_t *tbl, toth_key_t *key, bool alloc_on_collision) {
+    uint64_t idx = hash_func(tbl->num_rows, key);
+    toth_data_t *row = tbl->rows[idx];
 
     if(!row->user)
         return row;
@@ -181,25 +165,23 @@ toth_data_t *_lookup(
     // Collision
     toth_data_t *cur = row->next,
                 *prev = row;
-    for(int i=1; i < tbl->max_col_per_row; i++) {
+    for(int i=1; i < tbl->conf.max_col_per_row + 1; i++) {
         if(!cur) {
-            *col_idx = i;
+            if(!alloc_on_collision)
+                return NULL;
+
+            cur = toth_new_row();
+            if(!cur)
+                // XXX Bad news!
+                return NULL;
+
+            tbl->collisions++;
+            prev->next = cur;
+            cur->prev = prev;
             
-            if(alloc_on_collision) {
-                cur = toth_new_row();
-                if(!cur)
-                    // XXX Bad news!
-                    return NULL;
-
-                tbl->collisions++;
-                prev->next = cur;
-                cur->prev = prev;
-            }
-
             return cur;
         }
         else if(key_eq(key, &cur->key)) {
-            *col_idx = i;
             return cur;
         }
 
@@ -212,26 +194,28 @@ toth_data_t *_lookup(
 }
 
 // NOTE: Insert will overwrite any existing user data using the same key
-toth_data_t *_toth_insert(toth_t *tbl, toth_key_t *key, void *data) {
+toth_data_t *_toth_insert(toth_t *tbl, toth_key_t *key, void *data, toth_stat_t *stat) {
     // null data is not allowed
     // the user data pointer is used to check if a row is used
-    if(!data)
+    if(!data || !key) {
+        *stat = TOTH_EXCEPTION;
         return NULL;
+    }
 
     // XXX Handle this case better ...
     // - should allow overwrites
     // - use to influence the size of the next hash table
-    if(tbl->inserted > tbl->max_inserts)
+    if(tbl->inserted > tbl->max_inserts) {
+        *stat = TOTH_FULL;
         return NULL;
+    }
 
     tot_do_timeouts(tbl);
 
-    uint32_t idx;
-    uint8_t col_idx;
-
-    toth_data_t *row = _lookup(tbl, key, &idx, &col_idx, true);
+    toth_data_t *row = _lookup(tbl, key, true);
 
     if(!row) {
+        *stat = TOTH_FULL;
         return NULL;
     }
 
@@ -242,54 +226,45 @@ toth_data_t *_toth_insert(toth_t *tbl, toth_key_t *key, void *data) {
         tot_refresh(tbl, row);
         return row;
     }
-    else {
-        tbl->inserted++;
-        row->user = data;
-    }
-
+    
     if(tot_insert(tbl, row) != TOTH_OK) {
         if(row->prev) { 
             // this was a collision. we failed to insert into the TO table. .. free up. 
             // XXX this condition should never happen
             row->prev->next = row->next;
+            row->next->prev = row->prev;
             free(row);
             tbl->collisions--;
         }
+
+        *stat = TOTH_FULL;
         return NULL;
     }
 
     memcpy(&row->key, key, sizeof(row->key));
-
+    tbl->inserted++;
+    row->user = data;
+    
     // printf("Inserting %s into table %d\n", (char*)data, tbl->to_active);
     return row;
 }
 
 toth_stat_t toth_insert(toth_t *tbl, toth_key_t *key, void *data) {
-    // Require data
-    if(!data)
-        return TOTH_EXCEPTION;
-
-    if(!_toth_insert(tbl, key, data))
-        return TOTH_EXCEPTION;
-
-    return TOTH_OK;
+    toth_stat_t stat = TOTH_OK;
+    _toth_insert(tbl, key, data, &stat);
+    return stat;
 }
 
 // TODO change to:
 // toth_stat_t toth_insert_acquire(toth_t *tbl, toth_key_t *key, void *data, toth_data_t **ret) {
 // and make _toth_insert return approp toth_stat_t instead
 toth_data_t *toth_insert_acquire(toth_t *tbl, toth_key_t *key, void *data) {
-    // Required
-    if(!data)
-        return NULL;
-
-    return _toth_insert(tbl, key, data);
+    toth_stat_t stat = TOTH_OK;
+    return _toth_insert(tbl, key, data, &stat);
 }
 
 toth_data_t *toth_acquire(toth_t *tbl, toth_key_t *key) {
-    uint8_t col_idx = 0;
-    uint32_t data_idx = 0;
-    toth_data_t *row = _lookup(tbl, key, &data_idx, &col_idx, false);
+    toth_data_t *row = _lookup(tbl, key, false);
 
     if(!row || !row->user)
         return NULL;
@@ -299,35 +274,77 @@ toth_data_t *toth_acquire(toth_t *tbl, toth_key_t *key) {
 }
 
 // NOP - left for API compatibility
-void toth_release(toth_t *tbl, toth_data_t *row) { }
+void toth_release(toth_t *t, toth_data_t *row) { }
 
-void toth_remove(toth_t *tbl, toth_key_t *key) {
-    uint8_t col_idx = 0;
-    uint32_t data_idx = 0;
-
-    toth_data_t *row = _lookup(tbl, key, &data_idx, &col_idx, false);
+void toth_remove(toth_t *t, toth_key_t *key) {
+    toth_data_t *row = _lookup(t, key, false);
     
     if(!row || !row->user) 
         return;
 
-    tot_remove(tbl, row);
+    tot_remove(t, row);
 }
 
-void toth_get_stats(toth_t *tbl, toth_stats_t *stats) {
-    stats->num_rows = tbl->num_rows;
-    stats->inserted = tbl->inserted;
-    stats->collisions = tbl->collisions;
-    stats->max_inserts = tbl->max_inserts;
+void toth_get_stats(toth_t *t, toth_stats_t *stats) {
+    stats->num_rows = t->num_rows;
+    stats->inserted = t->inserted;
+    stats->collisions = t->collisions;
+    stats->max_inserts = t->max_inserts;
 }
 
-void toth_do_timeouts(toth_t *tbl) {
-    tot_do_timeouts(tbl);
+void toth_do_timeouts(toth_t *t) {
+    tot_do_timeouts(t);
 }
 
-void toth_do_resize(toth_t *tbl) {
-#warning resize not implemented
+void toth_do_resize(toth_t *t) {
+    // Need tests
+    #if 0
+    float usage = t->inserted / t->num_rows * 100;
+    int csize = prime_nearest_idx(t->num_rows);
+    int nsize = csize;
+
+    // Size up?
+    if(usage > t->conf.scale_up_pct) {
+        nsize = prime_larger_idx(csize);
+    } 
+    // Downsize?
+    else if(usage < t->conf.scale_down_pct) {
+        nsize = prime_smaller_idx(csize);
+    }
+
+    if(nsize == csize)
+        return;
+
+    toth_config_t conf;
+    memcpy(&conf, &t->conf, sizeof(conf));
+    conf.starting_rows = nsize;
+
+    toth_t *nt = toth_config_new(&conf, t->free_cb);
+
+    if(!nt) // Uh oh...
+        return;
+
+    tot_copy(nt, t);
+    tot_free(t);
+
+    for(int i=0; i<t->num_rows; i++) {
+        free(t->rows[i]);
+    }
+
+    free(t->rows);
+
+    memcpy(&t->conf, &conf, sizeof(conf));
+    t->num_rows = nt->num_rows;
+    t->max_inserts = nt->max_inserts;
+    t->rows = nt->rows;
+    #endif
 }
 
-void toth_randomize_refreshes(toth_t *tracker, float pct) {
-#warning todo 
+void toth_randomize_refreshes(toth_t *t, float pct) {
+    if(pct > 100 || pct <= 0)
+        return;
+
+    int32_t offset = pct / 100.0 * t->conf.timeout;
+
+    t->conf.timeout += rand() % offset - offset / 2;
 }
