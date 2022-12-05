@@ -4,13 +4,16 @@
 
 #include "to.h"
 
+void toth_key_free(toth_t *tbl, toth_data_t *row);
+uint64_t hash_func(uint64_t mask, toth_key_t *key);
+
 uint64_t time_ns() {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     return now.tv_sec * 1000000000 + now.tv_nsec;
 }
 
-void _toth_data_clear(toth_t *tbl, toth_data_t *row) {
+void _toth_data_clear(toth_t *tbl, toth_data_t *row) {   
     tbl->free_cb(row->user);
     tbl->inserted--;
     toth_data_t *p = row->prev,
@@ -21,20 +24,24 @@ void _toth_data_clear(toth_t *tbl, toth_data_t *row) {
         p->next = n;
         if(n)
             n->prev = p;
+        toth_key_free(tbl, row);
         free(row);
         tbl->collisions--;
     }
     else if(n) {
         // No prev. We're the head
         // Promote next
-        uint64_t idx = hash_func(tbl->num_rows, &row->key);
+        uint64_t idx = hash_func(tbl->num_rows, row->key);
         tbl->rows[idx] = n;
         n->prev = NULL;
-        tbl->collisions--;
+        toth_key_free(tbl, row);
         free(row);
+        tbl->collisions--;
     }
-    else 
+    else {
         row->user = NULL;
+        toth_key_free(tbl, row);
+    }
 }
 
 toth_to_tbl_t *_to_new_tbl(uint32_t size) {
@@ -161,7 +168,9 @@ void _to_clear_table(toth_t *tbl, toth_to_tbl_t *tot) {
         toth_to_node_t *to = &tot->tos[i];    
         toth_data_t *d = to->data;
 
+        toth_key_free(tbl, d);
         tbl->free_cb(d->user);
+
         if(d->prev) {
             if(d->next)
                 d->next->prev = d->prev;
@@ -185,29 +194,52 @@ void _to_clear_table(toth_t *tbl, toth_to_tbl_t *tot) {
     tot->inserts = 0;
 }
 
+toth_data_t *_lookup(   
+        toth_t *tbl, toth_key_t *key, bool alloc_on_collision);
+
+bool _toth_insert_from_copy(toth_t *tbl, toth_data_t *d) {
+    toth_data_t *row = _lookup(tbl, d->key, true);
+
+    // Should never happen... 
+    if(!row)
+        return false;
+
+    row->key = d->key;
+    d->key = NULL;
+    row->user = d->user;
+    d->user = NULL;
+
+    row->to_tbl = d->to_tbl;
+    row->to_idx = _to_append(tbl->tos[d->to_tbl], row);
+
+    return true;
+}
+
+// Copy from ftbl to dtbl
+// NOTE: If dtbl is smaller there is risk that not all nodes will be copied 
 void tot_copy(toth_t *dtbl, toth_t *ftbl) {
     toth_to_tbl_t *to = dtbl->tos[dtbl->to_active];
 
-    // Cleanup first
+    // Process any timeouts first
     tot_do_timeouts(ftbl);
 
     for(int i=0; i < ftbl->conf.timeout_tables; i++) {
         toth_to_tbl_t *from = ftbl->tos[i];
-        int32_t i = from->head;
 
-        while(i >= 0) {
+        int32_t j = from->head;
+
+        while(j >= 0) {
             // Shouldn't happen but just in case...
             if(to->inserts+1 >= to->num_rows)
                 return;
 
-            toth_to_node_t *ton = &from->tos[i];    
+            toth_to_node_t *ton = &from->tos[j];
             toth_data_t *d = ton->data;
     
-            _to_unlink(from, d->to_idx);
-            if(toth_insert(dtbl, &d->key, d->user) != TOTH_OK)
-                return;
+            if(!_toth_insert_from_copy(dtbl, d))
+                break;
 
-            d->user = NULL;
+            _to_unlink(from, d->to_idx);
         }
 
         from->head = -1;
@@ -252,9 +284,6 @@ void tot_new(toth_t *tbl) {
 void tot_free(toth_t *tbl) {
     for(int i=0; i<tbl->conf.timeout_tables; i++) {
         toth_to_tbl_t *tot = tbl->tos[i];
-
-        //printf("\nFreeing table %d\n", to_idx);
-
         _to_clear_table(tbl, tot);
         free(tot->tos);
         free(tot);    

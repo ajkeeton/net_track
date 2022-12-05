@@ -2,7 +2,7 @@
 /*
  * @author  Adam Keeton <ajkeeton@gmail.com>
  * Copyright (C) 2009-2020 Adam Keeton
- * TCP session tracker, with timeouts. Uses a "blue-green" mechanism for 
+ * TCP session tbl, with timeouts. Uses a "blue-green" mechanism for 
  * timeouts and automatic hash resizing. Resizing and timeouts are handled in 
  * their own thread
 */
@@ -14,9 +14,19 @@
 #include <time.h>
 #include <pthread.h>
 
-#define TOTH_DEFAULT_TIMEOUT 60 // seconds
+// Number of timeout tables to use
+// Higher numbers reduce the size of each batch but traffic spikes while under
+// load may cause a table to fill resulting in failed inserts
 #define TOTH_DEFAULT_TIMEOUT_TABLES 3
-#define TOTH_MAX_COL_PER_ROW 3 // NOTE: Must be smaller than a uint8_t (255)
+
+// Default timeout in seconds
+// This is divided by the number of tables to get a sliding window effect
+#define TOTH_DEFAULT_TIMEOUT 60
+
+// Max number of collisions allowed for a given row
+// Once reached the insert will fail
+#define TOTH_MAX_COL_PER_ROW 3 
+
 // When num_rows * hash_full_pct < number inserted, hash is considered 
 // full and we won't insert.
 #define TOTH_DEFAULT_HASH_FULL_PCT 6.0 // 6 percent
@@ -46,20 +56,25 @@ typedef struct _toth_config_t {
             max_col_per_row;
 } toth_config_t;
 
+typedef struct _ip {
+    union {
+        uint32_t v4;
+        uint64_t v6[2];
+    };
+} toth_ips_t;
+
 typedef struct _toth_key_t {
-    // Ports are intentionally kept as uint32_ts as an optimization in the key
-    // comparison function
-    uint32_t sip;
-    uint32_t sport;
+    toth_ips_t sip, dip;
 
-    uint32_t dip;
-    uint32_t dport;
+    uint16_t sport,
+             dport;
 
-    uint8_t vlan;
+    uint8_t vlan,
+            family;
 } toth_key_t;
 
 typedef struct _toth_data_t {
-    toth_key_t key;
+    toth_key_t *key;
     void *user;
 
     // For collisions
@@ -102,6 +117,9 @@ typedef struct _toth_t {
     // The hash table for user data
     toth_data_t **rows;
 
+    // A pool of keys so we can skip the dynamic alloc/frees
+    // toth_keys_t *keys;
+
     // The timeout tables
     uint32_t to_active;
     toth_to_tbl_t **tos;
@@ -111,48 +129,58 @@ typedef struct _toth_t {
 extern "C" {
 #endif
 
-// Allocate new session tracker using default config
+// Allocate new session tbl using default config
 toth_t *toth_new(void (*free_cb)(void *));
 
-// Allocate new session tracker using user config
+// Allocate new session tbl using user config
 toth_t *toth_config_new(toth_config_t *config, void (*free_cb)(void *));
 
 // Initialize a configuration with the default values
 void toth_config_init(toth_config_t *config);
 
-// Free session tracker
-void toth_free(toth_t *tracker);
+// Free session tbl
+void toth_free(toth_t *tbl);
 
 // Lookup entry. Points to user data, if any. Increments reference count
-toth_data_t *toth_acquire(toth_t *tracker, toth_key_t *key);
-
-// Release row, decrementing reference count
-void toth_release(toth_t *tracker, toth_data_t *data);
+void *toth_lookup(toth_t *tbl, toth_key_t *key);
 
 // Insert entry
-toth_stat_t toth_insert(toth_t *tracker, toth_key_t *key, void *data);
+// Will allocate a new key interally and copy 'key' to it
+toth_stat_t toth_keyed_insert(toth_t *tbl, toth_key_t *key, void *data);
 
-// Insert entry but return row with ref_count = 1
-toth_data_t *toth_insert_acquire(toth_t *tracker, toth_key_t *key, void *data);
+toth_stat_t toth_insert(toth_t *tbl, 
+    uint32_t *sip, uint32_t *dip, 
+    uint16_t sport, uint16_t dport, 
+    uint8_t vlan, uint8_t family, 
+    void *data);
 
 // Delete entry and free user data if any
-void toth_remove(toth_t *tracker, toth_key_t *key);
+void toth_remove(toth_t *tbl, toth_key_t *key);
 
 // Populate given stats structure
-void toth_get_stats(toth_t *tracker, toth_stats_t *stats);
+void toth_get_stats(toth_t *tbl, toth_stats_t *stats);
 
 // Force timeout code to execute rather than waiting for the next insert
-void toth_do_timeouts(toth_t *tracker);
+void toth_do_timeouts(toth_t *tbl);
 
 // Force a resize table to resize. New size is determined by current hash usage 
-void toth_do_resize(toth_t *tracker);
+void toth_do_resize(toth_t *tbl);
+
+// Convenience functions to initialize a key
+void toth_key_init4(toth_key_t *key, uint32_t sip, uint16_t sport, 
+                    uint32_t dip, uint16_t dport, uint8_t vlan);
+void toth_key_init6(toth_key_t *key, uint32_t sip[4], uint16_t sport, 
+                    uint32_t dip[4], uint16_t dport, uint8_t vlan);
+// Copy keys
+// IP family is considered so we don't have to do a full memcpy
+void toth_key_copy(toth_key_t *dst, toth_key_t *src);
 
 // Apply a random offset to the refresh and refresh timeout 
 // This prevents timing attacks and helps performance when several instances
 // are used in parallel
 //
 // Argument is a percentage applied to the current settings
-void toth_randomize_refreshes(toth_t *tracker, float pct);
+void toth_randomize_refreshes(toth_t *tbl, float pct);
 
 #ifdef __cplusplus
 }

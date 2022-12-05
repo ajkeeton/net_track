@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <time.h>
+#include <sys/socket.h> // for AF_INET
 #include "toth.h"
 #include "primes.h"
 #include "to.h"
@@ -119,7 +120,97 @@ void toth_free(toth_t *tbl) {
     free(tbl);
 }
 
-static inline int key_eq(toth_key_t *k1, toth_key_t *k2) {
+void toth_key_init4(toth_key_t *key, uint32_t sip, uint16_t sport, 
+                    uint32_t dip, uint16_t dport, uint8_t vlan) {
+
+}
+
+void toth_key_init6(toth_key_t *key, uint32_t sip[4], uint16_t sport, 
+                    uint32_t dip[4], uint16_t dport, uint8_t vlan) {
+
+
+}
+
+// Copy keys
+// Family is considered so we don't have to do a full memcpy
+toth_key_t *toth_key_alloc_copy(toth_key_t *src) {
+    //if(src->family == AF_INET)
+
+    toth_key_t *dst = (toth_key_t *)malloc(sizeof(toth_key_t));
+    if(!dst)
+        return NULL;
+
+    // TODO: stop using memcpy
+    memcpy(dst, src, sizeof(*src));
+
+    return dst;
+}
+
+void toth_key_free(toth_t *tbl, toth_data_t *row) {
+    // TODO: use key pool
+    free(row->key);
+    row->key = NULL;
+}
+
+bool toth_key_set(toth_data_t *row, toth_key_t *key) {
+    if(row->key)
+        free(row->key);
+
+    row->key = key;
+
+    #if 0
+    row->key = (toth_key_t *)malloc(sizeof(toth_key_t));
+
+    if(!row->key)
+         // XXX uh oh
+         return false;
+
+    //row->key ... =;
+    # endif
+    
+
+    return true;
+}
+
+int key_eq(toth_key_t *k1, toth_key_t *k2) {
+    if(k1->family == AF_INET) {
+        return
+            (
+                ((k1->sip.v4 == k2->sip.v4) &&
+                (k1->sport == k2->sport) &&
+                (k1->dip.v4 == k2->dip.v4) &&
+                (k1->dport == k2->dport)) ||
+                
+                ((k1->sip.v4 == k2->dip.v4) &&
+                (k1->sport == k2->dport) &&
+                (k1->dip.v4 == k2->sip.v4) &&
+                (k1->dport == k2->sport))
+            ) &&
+            k1->vlan == k2->vlan &&
+            k1->family == k2->family;
+    }
+
+    // IPv6
+    return
+        (
+            ((k1->sip.v6[0] == k2->sip.v6[0]) &&
+            (k1->sip.v6[1] == k2->sip.v6[1]) &&
+            (k1->sport == k2->sport) &&
+            (k1->dip.v6[0] == k2->dip.v6[0]) &&
+            (k1->dip.v6[1] == k2->dip.v6[1]) &&
+            (k1->dport == k2->dport)) ||
+
+            ((k1->sip.v6[0] == k2->dip.v6[0]) &&
+            (k1->sip.v6[1] == k2->dip.v6[1]) &&
+            (k1->sport == k2->dport) &&
+            (k1->dip.v6[0] == k2->sip.v6[0]) &&
+            (k1->dip.v6[1] == k2->sip.v6[1]) &&
+            (k1->dport == k2->sport))
+        ) &&
+        k1->vlan == k2->vlan &&
+        k1->family == k2->family;
+
+#if 0
     uint64_t *p1 = (uint64_t*)k1;
     uint64_t *p2 = (uint64_t*)k2;
 
@@ -127,17 +218,28 @@ static inline int key_eq(toth_key_t *k1, toth_key_t *k2) {
         ((p1[0] == p2[0] && p1[1] == p2[1]) ||
         (p1[0] == p2[1] && p1[1] == p2[0])) &&
         k1->vlan == k2->vlan;
+#endif
 }
 
 // Hash func: XOR32
 // Reference: https://www.researchgate.net/publication/281571413_COMPARISON_OF_HASH_STRATEGIES_FOR_FLOW-BASED_LOAD_BALANCING
 //static inline uint64_t hash_func(uint64_t mask, toth_key_t *key) {
 uint64_t hash_func(uint64_t mask, toth_key_t *key) {
-#if 1
+    uint64_t h = (uint64_t)(key->sport * key->dport);
+    
+    if(key->family == AF_INET)
+        h ^= (uint64_t)(key->sip.v4 ^ key->dip.v4);
+    else           
+        h ^= (uint64_t)(key->sip.v6[0] ^ key->dip.v6[0] ^ key->sip.v6[1] ^ key->dip.v6[1]);
+
+    h *= 1 + key->vlan;
+
+#if 0
     uint64_t h = (uint64_t)(key->sip ^ key->dip) ^
                   (uint64_t)(key->sport * key->dport);
     h *= 1 + key->vlan;
-#else
+#endif
+#if 0
     // XXX Gave similar distribution performance to the above
     MD5_CTX c;
     MD5_Init(&c);
@@ -158,7 +260,7 @@ toth_data_t *_lookup(
     if(!row->user)
         return row;
     
-    if(key_eq(key, &row->key)) {
+    if(key_eq(key, row->key)) {
         return row;
     }
 
@@ -181,7 +283,7 @@ toth_data_t *_lookup(
             
             return cur;
         }
-        else if(key_eq(key, &cur->key)) {
+        else if(key_eq(key, cur->key)) {
             return cur;
         }
 
@@ -212,6 +314,18 @@ toth_data_t *_toth_insert(toth_t *tbl, toth_key_t *key, void *data, toth_stat_t 
 
     tot_do_timeouts(tbl);
 
+#if 0
+    // Normal usage is dominated by lookups. We get a perf boost by doing
+    // 64-bit wide comparisons. When IPv4, set the extra IPv6 to 0 for the 
+    // future comparisons
+    if(key->family == AF_INET) {
+        key->sip.v6[0] &= 0xffffff;
+        key->dip.v6[0] &= 0xffffff;
+        key->sip.v6[1] = 0;
+        key->dip.v6[1] = 0;  
+    }
+#endif
+
     toth_data_t *row = _lookup(tbl, key, true);
 
     if(!row) {
@@ -219,12 +333,30 @@ toth_data_t *_toth_insert(toth_t *tbl, toth_key_t *key, void *data, toth_stat_t 
         return NULL;
     }
 
+    *stat = TOTH_OK;
+
     // Check if overwrite
+    // This is an edge case
     if(row->user && row->user != data) {
         tbl->free_cb(row->user);
         row->user = data;
+
+        // If we're here, we have two allocated keys
+        // they're either the same or there was a collision
+        // Either way, this is the row we want, so delete the old key
+        
+        free(row->key);
+        row->key = key;
+
         tot_refresh(tbl, row);
         return row;
+    }
+
+    // XXX need tot insert test so we don't have to cleanup after a failed TO insert
+
+    if(!toth_key_set(row, key)) {
+        *stat = TOTH_EXCEPTION;
+        return NULL;
     }
     
     if(tot_insert(tbl, row) != TOTH_OK) {
@@ -241,7 +373,7 @@ toth_data_t *_toth_insert(toth_t *tbl, toth_key_t *key, void *data, toth_stat_t 
         return NULL;
     }
 
-    memcpy(&row->key, key, sizeof(row->key));
+    //memcpy(&row->key, key, sizeof(row->key));
     tbl->inserted++;
     row->user = data;
     
@@ -249,32 +381,65 @@ toth_data_t *_toth_insert(toth_t *tbl, toth_key_t *key, void *data, toth_stat_t 
     return row;
 }
 
-toth_stat_t toth_insert(toth_t *tbl, toth_key_t *key, void *data) {
+toth_stat_t toth_keyed_insert(toth_t *tbl, toth_key_t *key, void *data) {
     toth_stat_t stat = TOTH_OK;
-    _toth_insert(tbl, key, data, &stat);
+
+    key = toth_key_alloc_copy(key);
+    if(!key)
+        return TOTH_ALLOC_FAILED;
+
+    if(!_toth_insert(tbl, key, data, &stat))
+        // XXX Switch to mempool
+        // Keys passed in are freshly allocated but we can just use the existing one
+        // Ok since this is an edge case
+        free(key);
+
     return stat;
 }
 
-// TODO change to:
-// toth_stat_t toth_insert_acquire(toth_t *tbl, toth_key_t *key, void *data, toth_data_t **ret) {
-// and make _toth_insert return approp toth_stat_t instead
-toth_data_t *toth_insert_acquire(toth_t *tbl, toth_key_t *key, void *data) {
+toth_stat_t toth_insert(toth_t *tbl, 
+    uint32_t *sip, uint32_t *dip, 
+    uint16_t sport, uint16_t dport, 
+    uint8_t vlan, uint8_t family, 
+    void *data) {
+
+    toth_key_t *key = (toth_key_t *)malloc(sizeof(toth_key_t));
+
+    if(!key)
+        return TOTH_ALLOC_FAILED;
+
     toth_stat_t stat = TOTH_OK;
-    return _toth_insert(tbl, key, data, &stat);
+
+    key->family = family;
+    key->vlan = vlan;
+    key->sport = sport;
+    key->dport = dport;
+
+    if(family == AF_INET) {
+        key->sip.v4 = *sip;
+        key->dip.v4 = *dip;
+    }
+    else {
+        key->sip.v6[0] = *(uint64_t*)sip;
+        key->dip.v6[0] = *(uint64_t*)dip;
+        key->sip.v6[1] = ((uint64_t*)sip)[1];
+        key->dip.v6[1] = ((uint64_t*)dip)[1];
+    }
+
+    if(!_toth_insert(tbl, key, data, &stat))
+        free(key); // XXX switch to mem pool
+    return stat;
 }
 
-toth_data_t *toth_acquire(toth_t *tbl, toth_key_t *key) {
+void *toth_lookup(toth_t *tbl, toth_key_t *key) {
     toth_data_t *row = _lookup(tbl, key, false);
 
     if(!row || !row->user)
         return NULL;
     
     tot_refresh(tbl, row);
-    return row;
+    return row->user;
 }
-
-// NOP - left for API compatibility
-void toth_release(toth_t *t, toth_data_t *row) { }
 
 void toth_remove(toth_t *t, toth_key_t *key) {
     toth_data_t *row = _lookup(t, key, false);
@@ -297,8 +462,6 @@ void toth_do_timeouts(toth_t *t) {
 }
 
 void toth_do_resize(toth_t *t) {
-    // Need tests
-    #if 0
     float usage = t->inserted / t->num_rows * 100;
     int csize = prime_nearest_idx(t->num_rows);
     int nsize = csize;
@@ -337,7 +500,6 @@ void toth_do_resize(toth_t *t) {
     t->num_rows = nt->num_rows;
     t->max_inserts = nt->max_inserts;
     t->rows = nt->rows;
-    #endif
 }
 
 void toth_randomize_refreshes(toth_t *t, float pct) {

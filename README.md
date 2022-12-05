@@ -1,28 +1,78 @@
 
-Blue Green Hash (bgh) is a solution for TCP/IP session tracking. Arbitrary data 
-can be associated with a session and old sessions are automatically timedout.
+# Time Out Hash (TOH)
 
-The implementation is inspired by connection draining blue-green deployments.
-BGH uses two threads, one of which controls a periodic refresh. During a 
-refresh:
+TOH is a solution for TCP/IP session tracking. It allows arbitrary data to be associated with a session.
 
-    * A new hash is allocated and is optionally sized to meet past resource 
+The implementation assumes a high lookup to insert ratio - ie, one insert for
+a TCP/IP session and a lookup for each packet. Because real-world packets may 
+arrive out of order or may be missing entirely, TOH times out sessions rather 
+than rely on a user to manually clear them. 
+
+Timeout data is tracked using ring of pre-allocated trees. The trees keep track
+of occupied rows in the hash of sessions. New sessions are inserted into the 
+"active" tree. Lookups ensure a row is in or moved to the active tree. After a configurable delta all hash rows tracked by the oldest tree are cleared. The 
+oldest tree then becomes the active tree.
+
+The trees act as a sliding window and allows timeouts to execute over batches
+of rows. The performance is significantly better than using a linked-list LRU
+since pointers do not need to be updated for each lookup. The common case
+lookup for a live TCP/IP session only requires a conventional hash lookup and
+an integer comparison that confirms the row is tracked by the active table.
+
+Benchmarks are included below.
+
+# Building
+
+Requires cmake and a recent gcc.
+
+```
+    mkdir build ; cd build ; cmake .. ; make
+```
+
+To test, run:
+
+```
+    ./tests/test_toth
+```
+
+Stress test:
+
+```
+    ./tests/test_toth -s
+```
+
+Test output includes benchmarks.
+
+# Usage
+
+...
+
+The hash can be resized using toth_do_resize.
+
+# Other included implementations
+
+Two additional implementations are included for reference purposes.
+
+* Linked List LRU (the conventional approach)
+* Blue Green Hash (BGH)
+
+BGH is inspired by connection draining blue-green deployments. It uses two
+threads, and two hash tables. One thread which controls a periodic refresh.
+During a refresh:
+
+    * If a resize is necessary, a new hash is allocated and to meet past resource 
       requirements
     * When a lookup is performed, and the data is found in the old table, it is
-      automatically transitioned to the new table
+      transitioned to the new table
     * All inserts go into the new table
-    * After the timeout period, the old hash is destroyed. Any sessions 
-      remaining in this hash are removed
+    * After the timeout period, the previous hash is cleared
 
 Since hash reallocation and cleanup are performed in their own thread, and 
 timeouts are performed on coarse blocks, the performance impact is negligible.
 
 Used by https://github.com/ajkeeton/pack_stat for TCP session stats
 
-# Building
 
-    mkdir build ; cd build ; cmake .. ; make
-    
 # Basic usage
 
     bgh_new(...)
@@ -39,7 +89,7 @@ Hashes must be provided with a callback to free data:
 
     ./sample/pcap_stats <pcap>
 
-# Configuring BGH
+# BGH Configuration
 
 To use with defaults (see bgh.h), just provide bgh_new with a callback to free
 the data you insert. This can not be null.
@@ -85,7 +135,7 @@ scale_down_pct, the hash will be resized during the new refresh period.
 Note, prime.cc contains a partial list of prime numbers. When scaling up or 
 down, BGH selects the next prime in the list in the direction of scaling.
 
-# Tests
+# BGH Tests
 
 To test, run:
 
@@ -95,6 +145,8 @@ To test, run:
 
 On my Macbook, the total time for 8192 inserts, deletes, and 819200 lookups:
 
-    - BGH: 40.855999 ms
-    - STL map: 337.914001 ms
+    - TOTH: ~150 ms
+    - BGH: ~150 ms
+    - Linked List LRU: ~6000 ms
+    - STL map, with inserts only - no timeouts:  ~400 ms
 
