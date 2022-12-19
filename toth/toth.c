@@ -15,10 +15,8 @@
 #include "primes.h"
 #include "to.h"
 
-void toth_config_init(toth_config_t *config) {
-    int len = prime_total();
-
-    config->starting_rows = prime_at_idx(len/3); 
+// Initialize a config to the defaults
+void toth_config_init(toth_config_t *config) {    
     config->timeout = TOTH_DEFAULT_TIMEOUT;
     config->hash_full_pct = TOTH_DEFAULT_HASH_FULL_PCT;
 
@@ -29,6 +27,9 @@ void toth_config_init(toth_config_t *config) {
     // If the number of inserts < number rows * scale_down_pct
     // Scale down
     config->scale_down_pct = TOTH_DEFAULT_HASH_FULL_PCT * 0.1;
+
+    int size =  prime_at_idx(prime_total()/3); 
+    config->max_inserts = size * config->hash_full_pct / 100;
 
     config->timeout_tables = TOTH_DEFAULT_TIMEOUT_TABLES;
 
@@ -45,12 +46,12 @@ toth_t *toth_new(void (*free_cb)(void *)) {
     return toth_config_new(&config, free_cb);
 }
 
-toth_t *toth_new_tbl(uint64_t rows, uint64_t max_inserts, void (*free_cb)(void *)) {
+toth_t *_toth_new_tbl(uint64_t nrows) {    
     toth_t *tbl = (toth_t*)malloc(sizeof(toth_t));
     if(!tbl)
         return NULL;
 
-    tbl->num_rows = rows;
+    tbl->num_rows = nrows;
     tbl->rows = (toth_data_t**)malloc(sizeof(toth_data_t*) * tbl->num_rows);
 
     if(!tbl->rows) {
@@ -69,40 +70,44 @@ toth_t *toth_new_tbl(uint64_t rows, uint64_t max_inserts, void (*free_cb)(void *
         }
     }
 
-    tbl->free_cb = free_cb;
-    tbl->inserted = tbl->collisions = 0;
-    tbl->max_inserts = max_inserts;
-    tbl->conf.timeout = ((uint64_t)TOTH_DEFAULT_TIMEOUT) * 100000000;
-    tbl->conf.timeout_tables = TOTH_DEFAULT_TIMEOUT_TABLES;
-
-    tot_new(tbl);
-
     return tbl;
 }
 
 toth_t *toth_config_new(toth_config_t *config, void (*free_cb)(void *)) {
-    toth_t *t = toth_new_tbl(
-        config->starting_rows, 
-        config->starting_rows * config->hash_full_pct/100.0, 
-        free_cb);
+    // Ensure sane values
+    if(config->timeout == 0)
+        config->timeout = TOTH_DEFAULT_TIMEOUT;
+    if(config->timeout_tables < 2)
+        config->timeout_tables = 2;
+    if(config->hash_full_pct < 0 || config->hash_full_pct > 100)
+        config->hash_full_pct = TOTH_DEFAULT_HASH_FULL_PCT;
+
+
+    int size = prime_nearest(config->max_inserts / config->hash_full_pct * 100.0);
+
+    toth_t *t = _toth_new_tbl(size);
 
     if(!t)
         return NULL;
 
-    if(t->conf.timeout_tables < 2)
-        t->conf.timeout_tables = 2;
+    memcpy(&t->conf, config, sizeof(*config));
 
+    // Internally we use a sliding window of timeouts with microsecond resolution
     t->conf.timeout = config->timeout * 1000000000 / (t->conf.timeout_tables - 1);
 
-    if(t->conf.timeout_tables != config->timeout_tables) {
-        // just re-init to correct size
-        tot_free(t);
-        t->conf.timeout_tables = config->timeout_tables;
-        tot_new(t);
-    }
+    t->free_cb = free_cb;
+    t->inserted = t->collisions = 0;
 
-    t->conf.max_col_per_row = config->max_col_per_row;
+    tot_new(t);
+
     return t;
+}
+
+toth_t *toth_new_tbl(uint64_t max, void (*free_cb)(void *)) {
+    toth_config_t conf;
+    toth_config_init(&conf);
+    conf.max_inserts = max;
+    return toth_config_new(&conf, free_cb);
 }
 
 void toth_free(toth_t *tbl) {
@@ -120,15 +125,14 @@ void toth_free(toth_t *tbl) {
     free(tbl);
 }
 
+// TODO, convenience func
 void toth_key_init4(toth_key_t *key, uint32_t sip, uint16_t sport, 
                     uint32_t dip, uint16_t dport, uint8_t vlan) {
-
 }
 
+// TODO, convenience func
 void toth_key_init6(toth_key_t *key, uint32_t sip[4], uint16_t sport, 
                     uint32_t dip[4], uint16_t dport, uint8_t vlan) {
-
-
 }
 
 // Copy keys
@@ -307,7 +311,7 @@ toth_data_t *_toth_insert(toth_t *tbl, toth_key_t *key, void *data, toth_stat_t 
     // XXX Handle this case better ...
     // - should allow overwrites
     // - use to influence the size of the next hash table
-    if(tbl->inserted > tbl->max_inserts) {
+    if(tbl->inserted >= tbl->conf.max_inserts) {
         *stat = TOTH_FULL;
         return NULL;
     }
@@ -373,7 +377,6 @@ toth_data_t *_toth_insert(toth_t *tbl, toth_key_t *key, void *data, toth_stat_t 
         return NULL;
     }
 
-    //memcpy(&row->key, key, sizeof(row->key));
     tbl->inserted++;
     row->user = data;
     
@@ -450,11 +453,15 @@ void toth_remove(toth_t *t, toth_key_t *key) {
     tot_remove(t, row);
 }
 
+bool toth_full(toth_t *t) {
+    return t->inserted == t->conf.max_inserts;
+}
+
 void toth_get_stats(toth_t *t, toth_stats_t *stats) {
     stats->num_rows = t->num_rows;
     stats->inserted = t->inserted;
     stats->collisions = t->collisions;
-    stats->max_inserts = t->max_inserts;
+    stats->max_inserts = t->conf.max_inserts;
 }
 
 void toth_do_timeouts(toth_t *t) {
@@ -463,16 +470,18 @@ void toth_do_timeouts(toth_t *t) {
 
 void toth_do_resize(toth_t *t) {
     float usage = t->inserted / t->num_rows * 100;
-    int csize = prime_nearest_idx(t->num_rows);
+    // Current size should already be one of our primes, but just in case 
+    // user overrode expected behavior....
+    int csize = prime_nearest(t->num_rows);
     int nsize = csize;
 
     // Size up?
     if(usage > t->conf.scale_up_pct) {
-        nsize = prime_larger_idx(csize);
+        nsize = prime_larger(csize);
     } 
     // Downsize?
     else if(usage < t->conf.scale_down_pct) {
-        nsize = prime_smaller_idx(csize);
+        nsize = prime_smaller(csize);
     }
 
     if(nsize == csize)
@@ -480,7 +489,8 @@ void toth_do_resize(toth_t *t) {
 
     toth_config_t conf;
     memcpy(&conf, &t->conf, sizeof(conf));
-    conf.starting_rows = nsize;
+
+    conf.max_inserts = nsize / conf.hash_full_pct * 100.0;
 
     toth_t *nt = toth_config_new(&conf, t->free_cb);
 
@@ -498,7 +508,6 @@ void toth_do_resize(toth_t *t) {
 
     memcpy(&t->conf, &conf, sizeof(conf));
     t->num_rows = nt->num_rows;
-    t->max_inserts = nt->max_inserts;
     t->rows = nt->rows;
 }
 

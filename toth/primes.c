@@ -64,6 +64,22 @@ int prime_nearest_idx(uint64_t val) {
     return _prime_nearest_idx(val, prime_total()/2, 0, prime_total());
 }
 
+uint64_t prime_nearest(uint64_t val) {
+    return primes[prime_nearest_idx(val)];
+}
+
+uint64_t prime_larger(uint64_t val) {
+    int idx = prime_nearest_idx(val);
+
+    return ++idx >= prime_total() ? primes[prime_total()] : primes[idx];
+}
+
+uint64_t prime_smaller(uint64_t val) {
+    int idx = prime_nearest_idx(val);
+
+    return --idx < 0 ? primes[0] : primes[idx];
+}
+
 uint64_t prime_at_idx(int idx) {
     if(idx < 0)
         return primes[0];

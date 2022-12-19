@@ -29,7 +29,7 @@
 
 // When num_rows * hash_full_pct < number inserted, hash is considered 
 // full and we won't insert.
-#define TOTH_DEFAULT_HASH_FULL_PCT 6.0 // 6 percent
+#define TOTH_DEFAULT_HASH_FULL_PCT 5.0 // 5 percent
 
 typedef enum _toth_stat_t {
     TOTH_OK,
@@ -47,16 +47,16 @@ typedef struct _toth_stats_t {
 } toth_stats_t;
 
 typedef struct _toth_config_t {
-    uint64_t starting_rows,
+    uint64_t max_inserts,
              timeout;
     float hash_full_pct,
           scale_up_pct,
           scale_down_pct;
-    uint8_t timeout_tables, 
-            max_col_per_row;
+    uint8_t timeout_tables,  // # of timeout tables (sliding window slices)
+            max_col_per_row; // Max collisions per row
 } toth_config_t;
 
-typedef struct _ip {
+typedef struct _toth_ip_t {
     union {
         uint32_t v4;
         uint64_t v6[2];
@@ -111,7 +111,6 @@ typedef struct _toth_t {
     uint64_t inserted, 
              collisions,
              num_rows,
-             max_inserts,
              to_last;
 
     // The hash table for user data
@@ -131,6 +130,10 @@ extern "C" {
 
 // Allocate new session tbl using default config
 toth_t *toth_new(void (*free_cb)(void *));
+
+// Allocate new session tbl using 'max' as the max number of inserts
+// All other values will be defaults
+toth_t *toth_new_tbl(uint64_t max, void (*free_cb)(void *));
 
 // Allocate new session tbl using user config
 toth_t *toth_config_new(toth_config_t *config, void (*free_cb)(void *));
@@ -157,6 +160,9 @@ toth_stat_t toth_insert(toth_t *tbl,
 // Delete entry and free user data if any
 void toth_remove(toth_t *tbl, toth_key_t *key);
 
+// Returns true if we've run out of room
+bool toth_full(toth_t *tbl);
+
 // Populate given stats structure
 void toth_get_stats(toth_t *tbl, toth_stats_t *stats);
 
@@ -166,11 +172,15 @@ void toth_do_timeouts(toth_t *tbl);
 // Force a resize table to resize. New size is determined by current hash usage 
 void toth_do_resize(toth_t *tbl);
 
+// TODO, convenience
+#if 0
 // Convenience functions to initialize a key
 void toth_key_init4(toth_key_t *key, uint32_t sip, uint16_t sport, 
                     uint32_t dip, uint16_t dport, uint8_t vlan);
 void toth_key_init6(toth_key_t *key, uint32_t sip[4], uint16_t sport, 
                     uint32_t dip[4], uint16_t dport, uint8_t vlan);
+#endif
+
 // Copy keys
 // IP family is considered so we don't have to do a full memcpy
 void toth_key_copy(toth_key_t *dst, toth_key_t *src);

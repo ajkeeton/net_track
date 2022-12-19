@@ -66,7 +66,7 @@ void basic(bool use_ipv6 = false) {
 
     toth_config_t conf;
     toth_config_init(&conf);
-    conf.starting_rows = 31;
+    conf.max_inserts = 10;
     conf.hash_full_pct = 50;
     uint64_t sip[2], dip[2];
 
@@ -211,9 +211,9 @@ void collisions() {
 
     toth_config_t conf;
     toth_config_init(&conf);
-    conf.starting_rows = 13;
+    conf.max_inserts = 50;
     conf.max_col_per_row = 100;
-    conf.hash_full_pct = 1000; // hack to allow lots of collisions
+    conf.hash_full_pct = 100; // hack to allow lots of collisions
 
     toth_t *tracker = toth_config_new(&conf, free_cb);
 
@@ -243,7 +243,9 @@ void collisions() {
     assert_lookup_eq(tracker, key2, NULL);
 
     // Fuzz
-    int num = conf.starting_rows*2;
+    int num = tracker->conf.max_inserts-2;
+    // Override max
+    tracker->conf.max_inserts = 10000;
     toth_key_t keys[num];
     memset(&keys, 0, sizeof(keys));
 
@@ -299,7 +301,7 @@ void bench() {
 
     toth_config_t conf;
     toth_config_init(&conf);
-    conf.starting_rows = 6000101;
+    conf.max_inserts = 6000101 * .06;
 
     toth_t *tracker = toth_config_new(&conf, nop_free_cb);
     toth_key_t keys[NUM_ITS];
@@ -366,7 +368,7 @@ void resize() {
 
     toth_config_t conf;
     toth_config_init(&conf);
-    conf.starting_rows = 100003;
+    conf.max_inserts = 100003 * .06;
     conf.timeout = 1;
 
 #if 0
@@ -458,7 +460,7 @@ void stress() {
 
     toth_config_t conf;
     toth_config_init(&conf);
-    conf.starting_rows = INIT_NUM_ROWS;
+    conf.max_inserts = INIT_NUM_ROWS * .06;
     conf.hash_full_pct = 4.5;
     conf.timeout = 4;
 

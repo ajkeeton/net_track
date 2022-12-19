@@ -124,7 +124,7 @@ toth_to_tbl_t *_tot_get_active(toth_t *tbl) {
 
 toth_stat_t tot_insert(toth_t *tbl, toth_data_t *row) {
     toth_to_tbl_t *tot = _tot_get_active(tbl);
-    if(tot->inserts + 1 >= tot->num_rows)
+    if(tot->inserts >= tot->num_rows)
         return TOTH_MEM_EXCEPTION;
 
     row->to_idx = _to_append(tot, row);
@@ -151,7 +151,7 @@ toth_stat_t tot_refresh(toth_t *tbl, toth_data_t *row) {
 
     toth_to_tbl_t *tot = _tot_get_active(tbl);
     // Make sure destination table has room   
-    if(tot->inserts + 1 >= tot->num_rows)
+    if(tot->inserts >= tot->num_rows)
         return TOTH_MEM_EXCEPTION;
 
     _to_move(tot, tbl->tos[row->to_tbl], tbl->to_active, row);
@@ -230,7 +230,7 @@ void tot_copy(toth_t *dtbl, toth_t *ftbl) {
 
         while(j >= 0) {
             // Shouldn't happen but just in case...
-            if(to->inserts+1 >= to->num_rows)
+            if(to->inserts >= to->num_rows)
                 return;
 
             toth_to_node_t *ton = &from->tos[j];
@@ -272,7 +272,7 @@ void tot_new(toth_t *tbl) {
     }
 
     for(int i=0; i < tbl->conf.timeout_tables; i++) {
-        tbl->tos[i] = _to_new_tbl(tbl->max_inserts);
+        tbl->tos[i] = _to_new_tbl(tbl->conf.max_inserts);
         if(!tbl->tos[i])
             // XXX
             abort();
