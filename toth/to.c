@@ -81,18 +81,65 @@ void _to_unlink(toth_to_tbl_t *tot, uint32_t idx) {
         tot->tail = to->prev;
     }
 
-    // XXX 
-    // Intentionally not decrementing "inserts".
-    // We don't currently keep track of holes.
-    // They will accumulate until we timeout.
-    // This is a side effect of the design.
+    to->next = to->prev = -1;
+    
+    // NOTE! 
+    // Intentionally not decrementing "inserted".
+    // We don't currently keep track of holes. They accumlate until timeout
+    // "inserted" is used as an index for appending nodes.
     // A future feature would be to keep track of those holes and fill them as
     // needed.
-    // XXX
+}
+
+void _validate_list(toth_to_tbl_t *tot) {
+    int32_t i = tot->head;
+
+    int n = 0;
+    // uint64_t start = tbl->inserted;
+    while(i >= 0) {
+        toth_to_node_t *to = &tot->tos[i];
+        i = to->next;
+        n++;
+    }
+
+    if(n != tot->inserted)
+        abort();
+}
+
+void debug_tbl(toth_to_tbl_t *tot) {
+    int32_t i = tot->head;
+    toth_to_node_t *to = NULL;
+    int n = 0;
+    printf("TOT %p: head: %d\ttail:%d\n", tot, tot->head, tot->tail);
+
+    while(i >= 0) {
+        to = &tot->tos[i];    
+        printf("next: %d\tprev: %d\tdata: %p\n", to->next, to->prev, to->data);
+        i = to->next;
+        n++;
+    }
+
+    if(tot->head < 0)
+        return;
+
+    int nn = 0;
+    // Walk backwards and confirm count is the same
+    i = tot->tail;
+    while(i >= 0) {
+        to = &tot->tos[i];
+        i = to->prev;
+        nn++;
+    }
+
+    assert(n == nn);
+    printf("Num nodes: %d\n", n);
 }
 
 int32_t _to_append(toth_to_tbl_t *tbl, toth_data_t *d) {
-    toth_to_node_t *nn = &tbl->tos[tbl->inserts];    
+    //puts("Appending");
+    //debug_tbl(tbl);
+
+    toth_to_node_t *nn = &tbl->tos[tbl->inserted];    
     nn->prev = tbl->tail;
 
     // First node
@@ -101,15 +148,18 @@ int32_t _to_append(toth_to_tbl_t *tbl, toth_data_t *d) {
     }
     else {
         toth_to_node_t *old_tail = &tbl->tos[tbl->tail];
-        old_tail->next = tbl->inserts;
+        old_tail->next = tbl->inserted;
     }
 
-    tbl->tail = tbl->inserts;
-    tbl->inserts++;
+    tbl->tail = tbl->inserted;
+    tbl->inserted++;
 
     nn->next = -1;
     nn->data = d;
 
+    //puts("Done appending");
+    //debug_tbl(tbl);
+    //puts("-------------");
     return tbl->tail;
 }
 
@@ -124,7 +174,7 @@ toth_to_tbl_t *_tot_get_active(toth_t *tbl) {
 
 toth_stat_t tot_insert(toth_t *tbl, toth_data_t *row) {
     toth_to_tbl_t *tot = _tot_get_active(tbl);
-    if(tot->inserts >= tot->num_rows)
+    if(tot->inserted >= tot->num_rows)
         return TOTH_MEM_EXCEPTION;
 
     row->to_idx = _to_append(tot, row);
@@ -151,7 +201,7 @@ toth_stat_t tot_refresh(toth_t *tbl, toth_data_t *row) {
 
     toth_to_tbl_t *tot = _tot_get_active(tbl);
     // Make sure destination table has room   
-    if(tot->inserts >= tot->num_rows)
+    if(tot->inserted >= tot->num_rows)
         return TOTH_MEM_EXCEPTION;
 
     _to_move(tot, tbl->tos[row->to_tbl], tbl->to_active, row);
@@ -191,7 +241,7 @@ void _to_clear_table(toth_t *tbl, toth_to_tbl_t *tot) {
 
     // printf("Timedout %lu\n", start - tbl->inserted);
     tot->head = tot->tail = -1;
-    tot->inserts = 0;
+    tot->inserted = 0;
 }
 
 toth_data_t *_lookup(   
@@ -230,7 +280,7 @@ void tot_copy(toth_t *dtbl, toth_t *ftbl) {
 
         while(j >= 0) {
             // Shouldn't happen but just in case...
-            if(to->inserts >= to->num_rows)
+            if(to->inserted >= to->num_rows)
                 return;
 
             toth_to_node_t *ton = &from->tos[j];
@@ -261,6 +311,17 @@ void tot_do_timeouts(toth_t *tbl) {
 
     // printf("Timing out tbl %p (%d)\n", to_tbl, tbl->to_active);
     _to_clear_table(tbl, _tot_get_active(tbl));
+}
+
+void to_foreach(toth_to_tbl_t *tot, void (*cb)(toth_key_t *, void *, void *), void *ctx) {
+    int32_t i = tot->head;
+    toth_to_node_t *to = NULL;
+
+    while(i >= 0) {
+        to = &tot->tos[i];    
+        cb(to->data->key, to->data->user, ctx);
+        i = to->next;
+    }
 }
 
 void tot_new(toth_t *tbl) {

@@ -94,7 +94,7 @@ typedef struct _toth_to_node_t {
 
 typedef struct _toth_to_tbl_t {
     uint32_t num_rows,
-             inserts;
+             inserted;
     int32_t head,
             tail;
     toth_to_node_t *tos;
@@ -171,6 +171,10 @@ void toth_do_timeouts(toth_t *tbl);
 
 // Force a resize table to resize. New size is determined by current hash usage 
 void toth_do_resize(toth_t *tbl);
+
+// Calls callback for each node in table
+// Callback is passed a pointer to the key, the data, and a user-provided context
+void toth_foreach(toth_t *tbl, void (*cb)(toth_key_t *, void *, void *), void *ctx);
 
 // TODO, convenience
 #if 0

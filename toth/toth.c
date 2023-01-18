@@ -92,7 +92,7 @@ toth_t *toth_config_new(toth_config_t *config, void (*free_cb)(void *)) {
 
     memcpy(&t->conf, config, sizeof(*config));
 
-    // Internally we use a sliding window of timeouts with microsecond resolution
+    // Internally we use a sliding window of timeouts with nanosecond resolution
     t->conf.timeout = config->timeout * 1000000000 / (t->conf.timeout_tables - 1);
 
     t->free_cb = free_cb;
@@ -138,8 +138,6 @@ void toth_key_init6(toth_key_t *key, uint32_t sip[4], uint16_t sport,
 // Copy keys
 // Family is considered so we don't have to do a full memcpy
 toth_key_t *toth_key_alloc_copy(toth_key_t *src) {
-    //if(src->family == AF_INET)
-
     toth_key_t *dst = (toth_key_t *)malloc(sizeof(toth_key_t));
     if(!dst)
         return NULL;
@@ -161,18 +159,6 @@ bool toth_key_set(toth_data_t *row, toth_key_t *key) {
         free(row->key);
 
     row->key = key;
-
-    #if 0
-    row->key = (toth_key_t *)malloc(sizeof(toth_key_t));
-
-    if(!row->key)
-         // XXX uh oh
-         return false;
-
-    //row->key ... =;
-    # endif
-    
-
     return true;
 }
 
@@ -181,14 +167,14 @@ int key_eq(toth_key_t *k1, toth_key_t *k2) {
         return
             (
                 ((k1->sip.v4 == k2->sip.v4) &&
-                (k1->sport == k2->sport) &&
-                (k1->dip.v4 == k2->dip.v4) &&
-                (k1->dport == k2->dport)) ||
-                
+                 (k1->sport == k2->sport) &&
+                 (k1->dip.v4 == k2->dip.v4) &&
+                 (k1->dport == k2->dport))
+                 ||
                 ((k1->sip.v4 == k2->dip.v4) &&
-                (k1->sport == k2->dport) &&
-                (k1->dip.v4 == k2->sip.v4) &&
-                (k1->dport == k2->sport))
+                 (k1->sport == k2->dport) &&
+                 (k1->dip.v4 == k2->sip.v4) &&
+                 (k1->dport == k2->sport))
             ) &&
             k1->vlan == k2->vlan &&
             k1->family == k2->family;
@@ -406,6 +392,7 @@ toth_stat_t toth_insert(toth_t *tbl,
     uint8_t vlan, uint8_t family, 
     void *data) {
 
+    // TODO switch to mem pool for keys
     toth_key_t *key = (toth_key_t *)malloc(sizeof(toth_key_t));
 
     if(!key)
@@ -430,7 +417,7 @@ toth_stat_t toth_insert(toth_t *tbl,
     }
 
     if(!_toth_insert(tbl, key, data, &stat))
-        free(key); // XXX switch to mem pool
+        free(key); // TODO switch to mem pool for keys
     return stat;
 }
 
@@ -518,4 +505,9 @@ void toth_randomize_refreshes(toth_t *t, float pct) {
     int32_t offset = pct / 100.0 * t->conf.timeout;
 
     t->conf.timeout += rand() % offset - offset / 2;
+}
+
+void toth_foreach(toth_t *tbl, void (*cb)(toth_key_t *, void *, void *), void *ctx) {
+    for(int i=0; i < tbl->conf.timeout_tables; i++)
+        to_foreach(tbl->tos[i], cb, ctx);
 }
