@@ -15,9 +15,9 @@
 extern "C" {
 toth_data_t *_insert_coll(
         toth_data_t *parent, toth_key_t *key, void *data);
-void tot_do_timeouts(toth_t *tbl);
 uint64_t time_ns();
 int key_eq(toth_key_t *k1, toth_key_t *k2) ;
+void tot_do_timeouts(toth_t *tbl);
 }
 
 void free_cb(void *p) {
@@ -25,6 +25,17 @@ void free_cb(void *p) {
 }
 
 void nop_free_cb(void *p) {}
+
+uint32_t allocated = 0;
+void count_frees_cb(void *p) {
+    allocated--;
+    free(p);
+}
+
+char *strdup_count(const char *s) {
+    allocated++;
+    return strdup(s);
+}
 
 void assert_eq(void *p, const char *s) {
     assert(!strcmp((char *)p, s));
@@ -150,31 +161,33 @@ void timeouts() {
     toth_config_init(&conf);
     conf.timeout = 1;
     conf.timeout_tables = 2;
+    allocated = 0;
 
-    toth_t *tracker = toth_config_new(&conf, free_cb);
+    toth_t *tracker = toth_config_new(&conf, count_frees_cb);
 
-    tracker->conf.timeout = 500000;
+    tracker->conf.timeout = 100000;
 
     toth_key_t key;
     // Bzero'ing to clean up pad bytes and prevent valgrind from complaining
     bzero(&key, sizeof(key)); 
     key.family = AF_INET;
 
+    ////////////////////////////////////////////////////
     // Add three, but cross the refresh + timeout period
-    key.sip.v4 = 1;
-    toth_keyed_insert(tracker, &key, strdup("1"));
-    usleep(550000);
 
-    // next insert will trigger a timeout but of an empty table since we just started
+    key.sip.v4 = 1;
+    toth_keyed_insert(tracker, &key, strdup_count("1"));
+    usleep(150000);
+    // the next insert triggers the timeout code ... but it's an empty table since we just started
     key.sip.v4 = 2;
-    toth_keyed_insert(tracker, &key, strdup("2"));
+    toth_keyed_insert(tracker, &key, strdup_count("2"));
 
     // Timeout 1
-    usleep(550000);
-
+    usleep(150000);
     key.sip.v4 = 3;
-    assert(toth_keyed_insert(tracker, &key, strdup("3")) == TOTH_OK);
+    toth_keyed_insert(tracker, &key, strdup_count("3"));
 
+    assert(tracker->inserted == 2);
     key.sip.v4 = 1;
     assert_lookup_eq(tracker, key, NULL);
     key.sip.v4 = 2;
@@ -183,25 +196,39 @@ void timeouts() {
     assert_lookup_eq(tracker, key, "3");
 
     // Make sure lookups keep entries alive
-    usleep(550000);
+    usleep(150000);
+    
     // forcing timeout code to run without insert
+    // active table is moved forward
     tot_do_timeouts(tracker);
+    // lookup moves this key to new table
     key.sip.v4 = 2;
     assert_lookup_eq(tracker, key, "2");
+    usleep(150000);
 
-    usleep(550000);
-    // NOTE: currently time outs only happen on insert
-    // this insert should timeout "bar"
-    key.sip.v4 = 4;
-    toth_keyed_insert(tracker, &key, strdup("4"));
+    // Force timeouts without an insert
+    tot_do_timeouts(tracker);
+    assert(tracker->inserted == 1);
+    key.sip.v4 = 1;
+    assert_lookup_eq(tracker, key, NULL);
+    key.sip.v4 = 2;
+    assert_lookup_eq(tracker, key, "2");
+    key.sip.v4 = 3;
+    assert_lookup_eq(tracker, key, NULL);
+    usleep(150000);
 
-    usleep(550000);
+    // active table moved forward, "2" in old table
+    tot_do_timeouts(tracker);
+    usleep(150000);
+    // "2" timed out
     tot_do_timeouts(tracker);
 
     key.sip.v4 = 1;
     assert_lookup_eq(tracker, key, NULL);
     key.sip.v4 = 2;
     assert_lookup_eq(tracker, key, NULL);
+    assert(tracker->inserted == 0);
+    assert(allocated == 0);
 
     toth_free(tracker);
 }
@@ -447,13 +474,20 @@ void key_cmp() {
 
 std::vector<toth_key_t> keys;
 
-toth_key_t get_rand_key() {
-    return keys[rand() % keys.size()];
+toth_key_t *get_rand_key() {
+    return &(keys[rand() % keys.size()]);
 }
 
-#define INIT_NUM_ROWS 600101
 #define NUM_KEYS 1024*256
-#define TEST_LENGTH 60*5
+toth_key_t *get_next_key() {
+    static int i = 0;
+    if(i+1 >= keys.size())
+        i = 0;
+    return &keys[i++];
+}
+
+#define INIT_NUM_ROWS 300043
+#define TEST_LENGTH 20 // 60*5
 
 void stress() {
     puts("Starting long-running stress test");
@@ -462,9 +496,9 @@ void stress() {
     toth_config_init(&conf);
     conf.max_inserts = INIT_NUM_ROWS * .06;
     conf.hash_full_pct = 4.5;
-    conf.timeout = 4;
+    conf.timeout = 2;
 
-    toth_t *tracker = toth_config_new(&conf, free_cb);
+    toth_t *tracker = toth_config_new(&conf, count_frees_cb);
     keys.resize(NUM_KEYS);
     for(int i=0; i<NUM_KEYS; i++) {
         gen_rand_key(&keys[i]);
@@ -484,9 +518,8 @@ void stress() {
              iteration = 0,
              tstart = 0;
 
+    assert(!allocated);
     while(1) {
-        toth_key_t key;
-
         time_t now = time(NULL);
         if(now - last_out > 2) {
             last_out = now;
@@ -496,7 +529,9 @@ void stress() {
             // print stats
             printf("\n%lus, iteration %llu. Simulating %d sessions\n",
                     time(NULL) - start, iteration, sessions_max);
-            printf("- inserted:       %llu\n", stats.inserted);
+            printf("- inserts tried:  %llu\n", insert_count + failed_insert);
+            printf("- active:         %llu\n", stats.inserted);
+            printf("- allocated:      %llu\n", allocated);
             printf("- lookups:        %llu\n", lookup_count);
             printf("- collisions:     %llu\n", stats.collisions);
             printf("- table size:     %llu\n", stats.num_rows);
@@ -530,13 +565,12 @@ void stress() {
 
         // New session
         if(!(rand() % 10) || !insert_count) {
-            key = get_rand_key();
-            void *d = strdup("data");
+            void *d = strdup_count("data");
 
             tstart = time_ns();
-            if(toth_keyed_insert(tracker, &key, d) != TOTH_OK) {
+            if(toth_keyed_insert(tracker, get_next_key(), d) != TOTH_OK) {
                 failed_insert++;
-                free(d);
+                count_frees_cb(d);
             }
             else {
                 insert_total_time += time_ns() - tstart;
@@ -546,9 +580,8 @@ void stress() {
 
         // Lookup
         if(!(rand() % 2)) {
-            key = keys[rand() % keys.size()];
             tstart = time_ns();
-            toth_lookup(tracker, &key);
+            toth_lookup(tracker, get_rand_key());
             lookup_total_time += time_ns() - tstart;
             lookup_count++;
             // assert_eq(toth_lookup(tracker, &key), "data");
@@ -556,19 +589,116 @@ void stress() {
 
         // Clear
         if(!(rand() % 20)) {
-            key = get_rand_key();
-            toth_remove(tracker, &key);
+            toth_remove(tracker, get_rand_key());
         }
 
         // Replace a key. Hack to force an old session to timeout
-        if(!(rand() % 20)) {
-            gen_rand_key(&keys[rand() % sessions_max]);
-        }
+        if(!(rand() % 10))
+            gen_rand_key(&keys[rand() % keys.size()]);
 
         iteration++;
     }
 
+    assert(allocated);
+
+    // Force everything to time out
+    tracker->conf.timeout = 0;
+    for(int i=0; i<tracker->conf.timeout_tables; i++)
+        tot_do_timeouts(tracker);
+
+    assert(!allocated);
+    assert(!tracker->inserted);
+    
     toth_free(tracker);
+}
+
+extern "C" {
+void _to_unlink(toth_to_tbl_t *tot, uint32_t idx);
+int32_t _to_append(toth_to_tbl_t *tbl, toth_data_t *d);
+toth_data_t *toth_new_row();
+}
+
+void to_append_unlink() {
+    toth_t *tbl = toth_new(nop_free_cb);
+
+    toth_to_tbl_t *tot0 = tbl->tos[0];
+    toth_to_tbl_t *tot1 = tbl->tos[1];
+
+    toth_key_t key;
+    bzero(&key, sizeof(key));
+    key.family == AF_INET;
+    key.sport = 1;
+
+    toth_data_t *d0 = toth_new_row();
+    d0->user = d0;
+    d0->key = &key;
+    d0->to_idx = _to_append(tot0, d0);
+    d0->to_tbl = 0;
+
+    toth_data_t *d1 = toth_new_row();
+    d1->user = d1;
+    d1->key = &key;
+    d1->to_idx = _to_append(tot0, d1);
+    d1->to_tbl = 0;
+
+    toth_data_t *d2 = toth_new_row();
+    d2->user = d2;
+    d2->key = &key;
+    d2->to_idx = _to_append(tot0, d2);
+    d2->to_tbl = 0;
+
+    assert(tot0->head == d0->to_idx);
+    assert(tot0->tos[0].next == d1->to_idx);
+    assert(tot0->tail == d2->to_idx);
+
+    // Unlink head
+    _to_unlink(tot0, d0->to_idx);
+    assert(tot0->head == d1->to_idx);
+    assert(tot0->tail == d2->to_idx);
+
+    // Move it to other table
+    d0->to_tbl = 1;
+    d0->to_idx = _to_append(tot1, d0);
+    assert(tot1->head == d0->to_idx);
+    assert(tot1->tail == d0->to_idx);
+
+    // Unlink tail
+    _to_unlink(tot0, d2->to_idx);
+    assert(tot0->tail == d1->to_idx);
+    // Unlink head
+    _to_unlink(tot0, d1->to_idx);
+    assert(tot0->tail == -1);
+    assert(tot0->head == -1);
+
+    // Remove d0 from the other table
+    _to_unlink(tot1, d0->to_idx);
+
+    // Put all 3 in a table
+    d2->to_idx = _to_append(tot0, d2);
+    assert(tot0->head == d2->to_idx);
+    assert(tot0->tail == d2->to_idx);
+    d1->to_idx = _to_append(tot0, d1);
+    assert(tot0->tail == d1->to_idx);
+    assert(tot0->tos[d1->to_idx].prev == d2->to_idx);
+    d0->to_idx = _to_append(tot0, d0);
+    d0->to_tbl = 0;
+
+    assert(tot0->head == d2->to_idx);
+    assert(tot0->tail == d0->to_idx);
+    assert(tot0->tos[tot0->head].next == d1->to_idx); // confirm d1 is middle node
+    assert(tot0->tos[d1->to_idx].next == d0->to_idx); // d1 next points to tail
+    assert(tot0->tos[d1->to_idx].prev == d2->to_idx); // d1 prev points to head
+
+    // Remove the d1, the middle node
+    _to_unlink(tot0, d1->to_idx);
+    assert(tot0->tos[tot0->head].next == d0->to_idx);
+    assert(tot0->tos[tot0->tail].prev == d2->to_idx);
+
+    // Cleanup;
+    _to_unlink(tot0, d0->to_idx);
+    _to_unlink(tot0, d2->to_idx);
+    free(d0); free(d1); free(d2);
+    toth_free(tbl);
 }
 
 int main(int argc, char **argv) {
@@ -580,6 +710,7 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    to_append_unlink();
     basic();
     basic(true); // ipv6
 

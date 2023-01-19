@@ -142,9 +142,8 @@ int32_t _to_append(toth_to_tbl_t *tbl, toth_data_t *d) {
     toth_to_node_t *nn = &tbl->tos[tbl->inserted];    
     nn->prev = tbl->tail;
 
-    // First node
     if(tbl->head == -1) {
-        tbl->head = 0;
+        tbl->head = tbl->inserted;
     }
     else {
         toth_to_node_t *old_tail = &tbl->tos[tbl->tail];
