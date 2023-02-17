@@ -95,7 +95,6 @@ void _validate_list(toth_to_tbl_t *tot) {
     int32_t i = tot->head;
 
     int n = 0;
-    // uint64_t start = tbl->inserted;
     while(i >= 0) {
         toth_to_node_t *to = &tot->tos[i];
         i = to->next;
@@ -136,9 +135,6 @@ void debug_tbl(toth_to_tbl_t *tot) {
 }
 
 int32_t _to_append(toth_to_tbl_t *tbl, toth_data_t *d) {
-    //puts("Appending");
-    //debug_tbl(tbl);
-
     toth_to_node_t *nn = &tbl->tos[tbl->inserted];    
     nn->prev = tbl->tail;
 
@@ -156,9 +152,6 @@ int32_t _to_append(toth_to_tbl_t *tbl, toth_data_t *d) {
     nn->next = -1;
     nn->data = d;
 
-    //puts("Done appending");
-    //debug_tbl(tbl);
-    //puts("-------------");
     return tbl->tail;
 }
 
@@ -182,7 +175,6 @@ toth_stat_t tot_insert(toth_t *tbl, toth_data_t *row) {
 }
 
 void tot_remove(toth_t *tbl, toth_data_t *d) {
-    //printf("- Clearing node %p / %s using table %d\n", d, (char*)d->user, d->to_tbl);
     _to_unlink(tbl->tos[d->to_tbl], d->to_idx);
     _toth_data_clear(tbl, d);
  }
@@ -205,14 +197,12 @@ toth_stat_t tot_refresh(toth_t *tbl, toth_data_t *row) {
 
     _to_move(tot, tbl->tos[row->to_tbl], tbl->to_active, row);
 
-    // printf("Moved %s from %d to %d (%p)\n", (char*)row->user, row->to_tbl, tbl->to_active, current);
     return TOTH_OK;
 }
 
 void _to_clear_table(toth_t *tbl, toth_to_tbl_t *tot) {
     int32_t i = tot->head;
 
-    // uint64_t start = tbl->inserted;
     while(i >= 0) {
         toth_to_node_t *to = &tot->tos[i];    
         toth_data_t *d = to->data;
@@ -238,7 +228,6 @@ void _to_clear_table(toth_t *tbl, toth_to_tbl_t *tot) {
         to->next = -1;
     }
 
-    // printf("Timedout %lu\n", start - tbl->inserted);
     tot->head = tot->tail = -1;
     tot->inserted = 0;
 }
@@ -300,7 +289,6 @@ void tot_do_timeouts(toth_t *tbl) {
     uint64_t t = time_ns();
 
     if((t - tbl->to_last) < tbl->conf.timeout) {
-        // puts("too early to time out");
         return;
     }
 
@@ -308,7 +296,6 @@ void tot_do_timeouts(toth_t *tbl) {
 
     tbl->to_active = tbl->to_active+1 < tbl->conf.timeout_tables ? tbl->to_active+1 : 0;
 
-    // printf("Timing out tbl %p (%d)\n", to_tbl, tbl->to_active);
     _to_clear_table(tbl, _tot_get_active(tbl));
 }
 

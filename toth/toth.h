@@ -158,6 +158,7 @@ toth_stat_t toth_insert(toth_t *tbl,
     void *data);
 
 // Delete entry and free user data if any
+// NOTE: some internal data won't be cleaned up until the timeout
 void toth_remove(toth_t *tbl, toth_key_t *key);
 
 // Returns true if we've run out of room
