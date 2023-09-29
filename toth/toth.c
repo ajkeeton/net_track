@@ -1,8 +1,7 @@
 /*
  * @author  Adam Keeton <ajkeeton@gmail.com>
  * Copyright (C) 2009-2020 Adam Keeton
- * TCP session tracker, with timeouts. Uses a "blue-green" mechanism for 
- * timeouts and automatic hash resizing
+ * TCP session tracker, with timeouts
 */
 
 #include <stdarg.h>
