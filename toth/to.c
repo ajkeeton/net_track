@@ -1,8 +1,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
-
 #include "to.h"
+#include "log.h"
 
 void toth_key_free(toth_t *tbl, toth_data_t *row);
 uint64_t hash_func(uint64_t mask, toth_key_t *key);
@@ -15,12 +15,14 @@ uint64_t time_ns() {
 
 void _toth_data_clear(toth_t *tbl, toth_data_t *row) {   
     tbl->free_cb(row->user);
+
     tbl->inserted--;
     toth_data_t *p = row->prev,
                 *n = row->next;
 
     if(p) {
-        // Collision. Need to fix pointers
+        // Collision. 
+        // Need to fix pointers
         p->next = n;
         if(n)
             n->prev = p;
@@ -29,6 +31,7 @@ void _toth_data_clear(toth_t *tbl, toth_data_t *row) {
         tbl->collisions--;
     }
     else if(n) {
+        // Collision
         // No prev. We're the head
         // Promote next
         uint64_t idx = hash_func(tbl->num_rows, row->key);
@@ -39,8 +42,8 @@ void _toth_data_clear(toth_t *tbl, toth_data_t *row) {
         tbl->collisions--;
     }
     else {
-        row->user = NULL;
         toth_key_free(tbl, row);
+        row->user = NULL;
     }
 }
 
@@ -109,10 +112,12 @@ void debug_tbl(toth_to_tbl_t *tot) {
     int32_t i = tot->head;
     toth_to_node_t *to = NULL;
     int n = 0;
+
     printf("TOT %p: head: %d\ttail:%d\n", tot, tot->head, tot->tail);
 
     while(i >= 0) {
-        to = &tot->tos[i];    
+        to = &tot->tos[i];
+
         printf("next: %d\tprev: %d\tdata: %p\n", to->next, to->prev, to->data);
         i = to->next;
         n++;
@@ -164,14 +169,19 @@ toth_to_tbl_t *_tot_get_active(toth_t *tbl) {
     return tbl->tos[tbl->to_active];
 }
 
-toth_stat_t tot_insert(toth_t *tbl, toth_data_t *row) {
+bool tot_full(toth_t *tbl) {
     toth_to_tbl_t *tot = _tot_get_active(tbl);
-    if(tot->inserted >= tot->num_rows)
-        return TOTH_MEM_EXCEPTION;
+    // this case should never be able to happen
+    return tot->inserted >= tot->num_rows;
+}
 
+void tot_insert(toth_t *tbl, toth_data_t *row) {
+    // NOTE: intentionally not checking tot_full. This code is 
+    // coupled with the calling function in toth and it should have
+    // already checked
+    toth_to_tbl_t *tot = _tot_get_active(tbl);
     row->to_idx = _to_append(tot, row);
     row->to_tbl = tbl->to_active;
-    return TOTH_OK;
 }
 
 void tot_remove(toth_t *tbl, toth_data_t *d) {
@@ -191,9 +201,9 @@ toth_stat_t tot_refresh(toth_t *tbl, toth_data_t *row) {
         return TOTH_OK;
 
     toth_to_tbl_t *tot = _tot_get_active(tbl);
-    // Make sure destination table has room   
+    // Make sure destination table has room
     if(tot->inserted >= tot->num_rows)
-        return TOTH_MEM_EXCEPTION;
+        return TOTH_FULL;
 
     _to_move(tot, tbl->tos[row->to_tbl], tbl->to_active, row);
 
@@ -214,7 +224,7 @@ void _to_clear_table(toth_t *tbl, toth_to_tbl_t *tot) {
             if(d->next)
                 d->next->prev = d->prev;
             d->prev->next = d->next;
-            // this was a collision. free here
+            // this was a collision. Free the row here
             free(d);
             tbl->collisions--;
         }
@@ -242,6 +252,9 @@ bool _toth_insert_from_copy(toth_t *tbl, toth_data_t *d) {
     if(!row)
         return false;
 
+    if(row->key)
+        free(row->key);
+
     row->key = d->key;
     d->key = NULL;
     row->user = d->user;
@@ -253,6 +266,8 @@ bool _toth_insert_from_copy(toth_t *tbl, toth_data_t *d) {
     return true;
 }
 
+// TODO: test coverage
+#if 0
 // Copy from ftbl to dtbl
 // NOTE: If dtbl is smaller there is risk that not all nodes will be copied 
 void tot_copy(toth_t *dtbl, toth_t *ftbl) {
@@ -283,6 +298,7 @@ void tot_copy(toth_t *dtbl, toth_t *ftbl) {
         from->head = -1;
     }
 }
+#endif
 
 // Purge oldest table if enough time has passed
 void tot_do_timeouts(toth_t *tbl) {
@@ -293,9 +309,9 @@ void tot_do_timeouts(toth_t *tbl) {
     }
 
     tbl->to_last = t;
-
     tbl->to_active = tbl->to_active+1 < tbl->conf.timeout_tables ? tbl->to_active+1 : 0;
 
+    DEBUG("Timing out %d with %d\n", tbl->to_active, tbl->tos[tbl->to_active]->inserted);
     _to_clear_table(tbl, _tot_get_active(tbl));
 }
 

@@ -10,9 +10,16 @@
 #include <unistd.h>
 #include <time.h>
 #include <sys/socket.h> // for AF_INET
+
+#define DEBUG_ASSERT
+#ifdef DEBUG_ASSERT
+#include <assert.h>
+#endif
+
 #include "toth.h"
 #include "primes.h"
 #include "to.h"
+#include "log.h"
 
 // Initialize a config to the defaults
 void toth_config_init(toth_config_t *config) {    
@@ -27,7 +34,7 @@ void toth_config_init(toth_config_t *config) {
     // Scale down
     config->scale_down_pct = TOTH_DEFAULT_HASH_FULL_PCT * 0.1;
 
-    int size =  prime_at_idx(prime_total()/3); 
+    int size = prime_at_idx(prime_total()/3); 
     config->max_inserts = size * config->hash_full_pct / 100;
 
     config->timeout_tables = TOTH_DEFAULT_TIMEOUT_TABLES;
@@ -62,8 +69,9 @@ toth_t *_toth_new_tbl(uint64_t nrows) {
         tbl->rows[i] = toth_new_row();
         if(!tbl->rows[i]) {
             // A row failed to alloc. Delete all up to this point
-            for(int j=0; j<i; j++)
+            for(int j=0; j<i; j++) {
                 free(tbl->rows[j]);
+            }
             free(tbl);
             return NULL;
         }
@@ -80,7 +88,6 @@ toth_t *toth_config_new(toth_config_t *config, void (*free_cb)(void *)) {
         config->timeout_tables = 2;
     if(config->hash_full_pct < 0 || config->hash_full_pct > 100)
         config->hash_full_pct = TOTH_DEFAULT_HASH_FULL_PCT;
-
 
     int size = prime_nearest(config->max_inserts / config->hash_full_pct * 100.0);
 
@@ -117,6 +124,9 @@ void toth_free(toth_t *tbl) {
     tot_free(tbl);
 
     for(int i=0; i<tbl->num_rows; i++) {
+        #ifdef DEBUG_ASSERT
+        assert(!tbl->rows[i]->key);
+        #endif
         free(tbl->rows[i]);
     }
 
@@ -136,30 +146,52 @@ void toth_key_init6(toth_key_t *key, uint32_t sip[4], uint16_t sport,
 
 // Copy keys
 // Family is considered so we don't have to do a full memcpy
-toth_key_t *toth_key_alloc_copy(toth_key_t *src) {
+toth_key_t *toth_key_alloc_copy(toth_data_t *row, toth_key_t *src) {
+    // If there's already a key, just overwrite it
+    if(row->key) {
+        memcpy(row->key, src, sizeof(*src));
+        return row->key;
+    }
+    
     toth_key_t *dst = (toth_key_t *)malloc(sizeof(toth_key_t));
     if(!dst)
         return NULL;
 
-    // TODO: stop using memcpy
-    memcpy(dst, src, sizeof(*src));
+    if(src->family == AF_INET) {
+        dst->sip.v6[0] = src->sip.v6[0];
+        dst->dip.v6[0] = src->dip.v6[0];
+        dst->sip.v6[1] = 0;
+        dst->dip.v6[1] = 0;  
+    }
+    else {
+        dst->sip.v6[0] = src->sip.v6[0];
+        dst->dip.v6[0] = src->dip.v6[0];
+        dst->sip.v6[1] = src->sip.v6[1];
+        dst->dip.v6[1] = src->dip.v6[1];    
+    }
+    dst->sport = src->sport;
+    dst->dport = src->dport;
+    dst->vlan = src->vlan;
+    dst->family = src->family;
 
-    return dst;
+    row->key = dst;
+    return row->key;
 }
 
 void toth_key_free(toth_t *tbl, toth_data_t *row) {
-    // TODO: use key pool
     free(row->key);
     row->key = NULL;
 }
 
-bool toth_key_set(toth_data_t *row, toth_key_t *key) {
-    if(row->key)
+#if 0
+void toth_key_set(toth_data_t *row, toth_key_t *key) {
+    if(row->key) {
         free(row->key);
-
+        active_keys--;
+    }
     row->key = key;
-    return true;
 }
+#endif
 
 int key_eq(toth_key_t *k1, toth_key_t *k2) {
     if(k1->family == AF_INET) {
@@ -284,105 +316,12 @@ toth_data_t *_lookup(
     return NULL;
 }
 
-// NOTE: Insert will overwrite any existing user data using the same key
-toth_data_t *_toth_insert(toth_t *tbl, toth_key_t *key, void *data, toth_stat_t *stat) {
-    // null data is not allowed
-    // the user data pointer is used to check if a row is used
-    if(!data || !key) {
-        *stat = TOTH_EXCEPTION;
-        return NULL;
-    }
-
-    // XXX Handle this case better ...
-    // - should allow overwrites
-    // - use to influence the size of the next hash table
-    if(tbl->inserted >= tbl->conf.max_inserts) {
-        *stat = TOTH_FULL;
-        return NULL;
-    }
-
-    tot_do_timeouts(tbl);
-
-#if 0
-    // Normal usage is dominated by lookups. We get a perf boost by doing
-    // 64-bit wide comparisons. When IPv4, set the extra IPv6 to 0 for the 
-    // future comparisons
-    if(key->family == AF_INET) {
-        key->sip.v6[0] &= 0xffffff;
-        key->dip.v6[0] &= 0xffffff;
-        key->sip.v6[1] = 0;
-        key->dip.v6[1] = 0;  
-    }
-#endif
-
-    toth_data_t *row = _lookup(tbl, key, true);
-
-    if(!row) {
-        *stat = TOTH_FULL;
-        return NULL;
-    }
-
-    *stat = TOTH_OK;
-
-    // Check if overwrite
-    // This is an edge case
-    if(row->user && row->user != data) {
-        tbl->free_cb(row->user);
-        row->user = data;
-
-        // If we're here, we have two allocated keys
-        // they're either the same or there was a collision
-        // Either way, this is the row we want, so delete the old key
-        
-        free(row->key);
-        row->key = key;
-
-        tot_refresh(tbl, row);
-        return row;
-    }
-
-    // XXX need tot insert test so we don't have to cleanup after a failed TO insert
-
-    if(!toth_key_set(row, key)) {
-        *stat = TOTH_EXCEPTION;
-        return NULL;
-    }
-    
-    if(tot_insert(tbl, row) != TOTH_OK) {
-        if(row->prev) { 
-            // this was a collision. we failed to insert into the TO table. .. free up. 
-            // XXX this condition should never happen
-            row->prev->next = row->next;
-            row->next->prev = row->prev;
-            free(row);
-            tbl->collisions--;
-        }
-
-        *stat = TOTH_FULL;
-        return NULL;
-    }
-
-    tbl->inserted++;
-    row->user = data;
-    
-    // printf("Inserting %s into table %d\n", (char*)data, tbl->to_active);
-    return row;
-}
-
 toth_stat_t toth_keyed_insert(toth_t *tbl, toth_key_t *key, void *data) {
-    toth_stat_t stat = TOTH_OK;
-
-    key = toth_key_alloc_copy(key);
-    if(!key)
-        return TOTH_ALLOC_FAILED;
-
-    if(!_toth_insert(tbl, key, data, &stat))
-        // XXX Switch to mempool
-        // Keys passed in are freshly allocated but we can just use the existing one
-        // Ok since this is an edge case
-        free(key);
-
-    return stat;
+    return toth_insert(tbl,
+        &key->sip.v4, &key->dip.v4, 
+        key->sport, key->dport, 
+        key->vlan, key->family,
+        data);
 }
 
 toth_stat_t toth_insert(toth_t *tbl, 
@@ -391,33 +330,65 @@ toth_stat_t toth_insert(toth_t *tbl,
     uint8_t vlan, uint8_t family, 
     void *data) {
 
-    // TODO switch to mem pool for keys
-    toth_key_t *key = (toth_key_t *)malloc(sizeof(toth_key_t));
+    if(!data)
+        return TOTH_EXCEPTION;
+    
+    tot_do_timeouts(tbl);
 
-    if(!key)
-        return TOTH_ALLOC_FAILED;
+    if(tbl->inserted >= tbl->conf.max_inserts || tot_full(tbl))
+        return TOTH_FULL;
 
-    toth_stat_t stat = TOTH_OK;
-
-    key->family = family;
-    key->vlan = vlan;
-    key->sport = sport;
-    key->dport = dport;
-
+    toth_key_t key;
     if(family == AF_INET) {
-        key->sip.v4 = *sip;
-        key->dip.v4 = *dip;
+        key.sip.v6[0] = *sip;
+        key.dip.v6[0] = *dip;
+        key.sip.v6[1] = 0;
+        key.dip.v6[1] = 0;
     }
     else {
-        key->sip.v6[0] = *(uint64_t*)sip;
-        key->dip.v6[0] = *(uint64_t*)dip;
-        key->sip.v6[1] = ((uint64_t*)sip)[1];
-        key->dip.v6[1] = ((uint64_t*)dip)[1];
+        key.sip.v6[0] = ((uint64_t*)sip)[0];
+        key.dip.v6[0] = ((uint64_t*)dip)[0];
+        key.sip.v6[1] = ((uint64_t*)sip)[1];
+        key.dip.v6[1] = ((uint64_t*)dip)[1];
+    }
+    key.sport = sport;
+    key.dport = dport;
+    key.vlan = vlan;
+    key.family = family;
+
+    toth_data_t *row = _lookup(tbl, &key, true);
+    if(!row)
+        // NOTE This does not give clear indication if the problem was 
+        // collisions
+        return TOTH_FULL;
+    
+    // Handle overwrite
+    if(row->user && (row->user != data)) {
+        tbl->free_cb(row->user);
+        if(!key_eq(row->key, &key)) {
+            memcpy(row->key, &key, sizeof(key));
+        }
+
+        row->user = data;
+
+        if(tot_refresh(tbl, row) != TOTH_OK) {
+            // This should never happen!
+            // If it does, we'll silently fail and the session will
+            // get timed out sooner than expected
+        }
+        return TOTH_OK;
     }
 
-    if(!_toth_insert(tbl, key, data, &stat))
-        free(key); // TODO switch to mem pool for keys
-    return stat;
+    if(!toth_key_alloc_copy(row, &key))
+        return TOTH_EXCEPTION;
+
+    tot_insert(tbl, row);
+
+    tbl->inserted++;
+    row->user = data;
+    
+    DEBUG("Inserting %p into table %d\n", data, tbl->to_active);
+    return TOTH_OK;
 }
 
 void *toth_lookup(toth_t *tbl, toth_key_t *key) {
@@ -440,7 +411,7 @@ void toth_remove(toth_t *t, toth_key_t *key) {
 }
 
 bool toth_full(toth_t *t) {
-    return t->inserted == t->conf.max_inserts;
+    return t->inserted >= t->conf.max_inserts;
 }
 
 void toth_get_stats(toth_t *t, toth_stats_t *stats) {
@@ -473,6 +444,8 @@ void toth_do_resize(toth_t *t) {
     if(nsize == csize)
         return;
 
+// TODO: test cases
+#if 0
     toth_config_t conf;
     memcpy(&conf, &t->conf, sizeof(conf));
 
@@ -495,6 +468,7 @@ void toth_do_resize(toth_t *t) {
     memcpy(&t->conf, &conf, sizeof(conf));
     t->num_rows = nt->num_rows;
     t->rows = nt->rows;
+#endif
 }
 
 void toth_randomize_refreshes(toth_t *t, float pct) {

@@ -159,7 +159,6 @@ void timeouts() {
 
     toth_config_t conf;
     toth_config_init(&conf);
-    conf.timeout = 1;
     conf.timeout_tables = 2;
     allocated = 0;
 
@@ -169,7 +168,9 @@ void timeouts() {
 
     toth_key_t key;
     // Bzero'ing to clean up pad bytes and prevent valgrind from complaining
-    bzero(&key, sizeof(key)); 
+    bzero(&key, sizeof(key));
+    key.sport = 1;
+    key.dport = 2;
     key.family = AF_INET;
 
     ////////////////////////////////////////////////////
@@ -177,13 +178,13 @@ void timeouts() {
 
     key.sip.v4 = 1;
     toth_keyed_insert(tracker, &key, strdup_count("1"));
-    usleep(150000);
+    tracker->to_last = 0;
     // the next insert triggers the timeout code ... but it's an empty table since we just started
     key.sip.v4 = 2;
     toth_keyed_insert(tracker, &key, strdup_count("2"));
 
-    // Timeout 1
-    usleep(150000);
+    // Real timeout
+    tracker->to_last = 0;
     key.sip.v4 = 3;
     toth_keyed_insert(tracker, &key, strdup_count("3"));
 
@@ -196,7 +197,7 @@ void timeouts() {
     assert_lookup_eq(tracker, key, "3");
 
     // Make sure lookups keep entries alive
-    usleep(150000);
+    tracker->to_last = 0;
     
     // forcing timeout code to run without insert
     // active table is moved forward
@@ -204,7 +205,7 @@ void timeouts() {
     // lookup moves this key to new table
     key.sip.v4 = 2;
     assert_lookup_eq(tracker, key, "2");
-    usleep(150000);
+    tracker->to_last = 0;
 
     // Force timeouts without an insert
     tot_do_timeouts(tracker);
@@ -215,11 +216,11 @@ void timeouts() {
     assert_lookup_eq(tracker, key, "2");
     key.sip.v4 = 3;
     assert_lookup_eq(tracker, key, NULL);
-    usleep(150000);
+    tracker->to_last = 0;
 
     // active table moved forward, "2" in old table
     tot_do_timeouts(tracker);
-    usleep(150000);
+    tracker->to_last = 0;
     // "2" timed out
     tot_do_timeouts(tracker);
 
@@ -231,6 +232,111 @@ void timeouts() {
     assert(allocated == 0);
 
     toth_free(tracker);
+}        
+
+void timeouts_tricky() {
+    printf("%s\n", __func__);
+
+    toth_config_t conf;
+    toth_config_init(&conf);
+    conf.timeout_tables = 3;
+    conf.max_inserts = 9;
+    toth_t *tbl = toth_config_new(&conf, count_frees_cb);
+    toth_key_t key, key1, key2, key3;
+    
+    // Populate each table
+    for(int i = 0; i < conf.timeout_tables*2; i++) {
+        for(int j=0; j < conf.max_inserts*.75; j++) {
+            gen_rand_key(&key);
+            char test[128];
+            sprintf(test, "test %d.%d", i, j);
+            char *p = strdup(test);
+            if(toth_keyed_insert(tbl, &key, p) != TOTH_OK)
+                free(p);
+        }
+        tbl->to_last = 0;
+    }
+
+    assert(tbl->inserted == conf.max_inserts);
+
+    // Force timeout on next insert
+    tbl->to_last = 0;
+
+    ///////////////////////////////////////////////////////////////////
+    // Next set of tesets will make sure nodes will move across tables
+    // on lookup
+    char *p = strdup("test A");
+    gen_rand_key(&key);
+    assert(toth_keyed_insert(tbl, &key, p) == TOTH_OK);
+
+    p = strdup("test B");
+    gen_rand_key(&key1);
+    assert(toth_keyed_insert(tbl, &key1, p) == TOTH_OK);
+    
+    p = strdup("test C");
+    gen_rand_key(&key2);
+    assert(toth_keyed_insert(tbl, &key2, p) == TOTH_OK);
+
+    p = strdup("test D");
+    gen_rand_key(&key3);
+    assert(toth_keyed_insert(tbl, &key3, p) == TOTH_OK);
+
+    // Force timeout
+    tbl->to_last = 0; 
+    tot_do_timeouts(tbl);
+
+    // Use the lookup to move our rows across tables
+    assert_lookup_eq(tbl, key3, "test D");
+    assert_lookup_eq(tbl, key2, "test C");
+    assert_lookup_eq(tbl, key1, "test B");
+ 
+    tbl->to_last = 0; 
+    tot_do_timeouts(tbl);
+
+    // Move key1 forward again
+    assert_lookup_eq(tbl, key1, "test B");
+    tbl->to_last = 0;
+    tot_do_timeouts(tbl);
+    assert(tbl->inserted == 3);
+
+    // Move key1 forward again
+    // Rest will be getting timed out
+    assert_lookup_eq(tbl, key1, "test B");
+    tbl->to_last = 0;
+    tot_do_timeouts(tbl);
+
+    assert(tbl->inserted == 1);
+    assert_lookup_eq(tbl, key1, "test B");
+
+    // Force an overwrite
+    p = strdup("test E");
+    assert(toth_keyed_insert(tbl, &key1, p) == TOTH_OK);
+    assert_lookup_eq(tbl, key1, "test E");
+    assert(tbl->inserted == 1);
+    tbl->to_last = 0;
+
+    // Swapping ports to create a collision
+    key1.sport = key1.sport + key1.dport;
+    key1.dport = key1.sport - key1.dport;
+    key1.sport = key1.sport - key1.dport;
+    p = strdup("test F");
+    assert(toth_keyed_insert(tbl, &key1, p) == TOTH_OK);
+    assert_lookup_eq(tbl, key1, "test F");
+    assert(tbl->inserted == 2);
+
+    tbl->to_last = 0;
+    tot_do_timeouts(tbl);
+    assert(tbl->inserted == 2);
+
+    tbl->to_last = 0;
+    tot_do_timeouts(tbl);
+    assert(tbl->inserted == 1);
+
+    tbl->to_last = 0;
+    tot_do_timeouts(tbl);
+    assert(tbl->inserted == 0);
+    
+    toth_free(tbl);
 }
 
 void collisions() {
@@ -240,7 +346,7 @@ void collisions() {
     toth_config_init(&conf);
     conf.max_inserts = 50;
     conf.max_col_per_row = 100;
-    conf.hash_full_pct = 100; // hack to allow lots of collisions
+    conf.hash_full_pct = 100; // hack to allow a large number of collisions
 
     toth_t *tracker = toth_config_new(&conf, free_cb);
 
@@ -253,7 +359,7 @@ void collisions() {
     key1.dip.v4 = 200;
     key1.sport = 3000;
     key1.dport = 4000; 
-    // Same IPs, swapped ports, def a hash collision
+    // Force hash collision by swapping ports 
     key2.sip.v4 = 10;
     key2.dip.v4 = 200;
     key2.sport = 4000;
@@ -307,6 +413,17 @@ void collisions() {
             assert_lookup_eq(tracker, keys[i], NULL);
         else
             assert_lookup_eq(tracker, keys[i], buf);
+    }
+
+    for(int i=0; i < num; i++) {
+        toth_lookup(tracker, &keys[i]);
+
+        // Force periodic timeouts. These aren't tested directly
+        // but will trigger valgrind if we lose pointers
+        if(i && !(i % (num/10))) {
+            tracker->to_last = 0;
+            tot_do_timeouts(tracker);
+        }
     }
 
     toth_free(tracker);
@@ -616,6 +733,7 @@ extern "C" {
 void _to_unlink(toth_to_tbl_t *tot, uint32_t idx);
 int32_t _to_append(toth_to_tbl_t *tbl, toth_data_t *d);
 toth_data_t *toth_new_row();
+toth_key_t *toth_key_alloc_copy(toth_data_t *row, toth_key_t *src);
 }
 
 void to_append_unlink() {
@@ -631,19 +749,19 @@ void to_append_unlink() {
 
     toth_data_t *d0 = toth_new_row();
     d0->user = d0;
-    d0->key = &key;
+    toth_key_alloc_copy(d0, &key);
     d0->to_idx = _to_append(tot0, d0);
     d0->to_tbl = 0;
 
     toth_data_t *d1 = toth_new_row();
     d1->user = d1;
-    d1->key = &key;
+    toth_key_alloc_copy(d1, &key);
     d1->to_idx = _to_append(tot0, d1);
     d1->to_tbl = 0;
 
     toth_data_t *d2 = toth_new_row();
     d2->user = d2;
-    d2->key = &key;
+    toth_key_alloc_copy(d2, &key);
     d2->to_idx = _to_append(tot0, d2);
     d2->to_tbl = 0;
 
@@ -697,6 +815,7 @@ void to_append_unlink() {
     // Cleanup;
     _to_unlink(tot0, d0->to_idx);
     _to_unlink(tot0, d2->to_idx);
+    free(d0->key); free(d1->key); free(d2->key);
     free(d0); free(d1); free(d2);
     toth_free(tbl);
 }
@@ -710,7 +829,6 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    to_append_unlink();
     basic();
     basic(true); // ipv6
 
@@ -718,6 +836,8 @@ int main(int argc, char **argv) {
     resize();
     key_cmp();
     timeouts();
+    to_append_unlink();
+    timeouts_tricky();
     bench();
 
     // TODO: check hash distrib?
