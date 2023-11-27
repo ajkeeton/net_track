@@ -187,7 +187,7 @@ void tot_insert(toth_t *tbl, toth_data_t *row) {
 void tot_remove(toth_t *tbl, toth_data_t *d) {
     _to_unlink(tbl->tos[d->to_tbl], d->to_idx);
     _toth_data_clear(tbl, d);
- }
+}
 
 // Move timeout to the active table
 void _to_move(toth_to_tbl_t *to, toth_to_tbl_t *from, uint8_t tidx, toth_data_t *row) {

@@ -45,9 +45,70 @@ Test output includes benchmarks.
 
 # Usage
 
-...
+Basic usage:
 
-The hash can be resized using toth_do_resize.
+    toth_t *t = toth_new(free_cb);
+    toth_insert(t, 
+        <source ip>, <dest ip>, 
+        <source port>, <dest port>, 
+        <vlan>, <ip family>, <data pointer>)
+    toth_lookup(t, <key>)
+
+Less basic usage:
+
+    toth_config_t conf;
+    toth_config_init(&conf);
+    conf.timeout = session_timeout_in_seconds;
+    // Percentage. Used to calculate when a hash is considered "full"
+    conf.hash_full_pct = 4.5; 
+    conf.max_inserts = estimated_max_number_of_sessions;
+    // Make collisions per row
+    conf.max_col_per_row = 3;
+    toth_t *t = toth_config_new(&conf, free_cb);
+    ...
+    // NOTE: toth is optimized for lookups. Timeouts only happen on insert
+    // So if the table is full, force timeouts
+    if(toth_full(t)) {
+        toth_do_timeouts(t);
+    }
+    ...
+    toth_key_t key = { <source ip>, <dest ip> .... }
+    toth_insert(t, &key, data);
+    data = toth_lookup(t, &key)
+    
+Rows automatically timeout on toth_insert, or when toth_do_timeouts is called.
+
+    toth_new - Create new table with hardcoded defaults
+    toth_config_init - Initialize a config structure with defaults
+    toth_config_new - Create new table with provided config
+    toth_insert - Perform insert using IP, port, vlan, etc
+    toth_keyed_insert - Perform an insert using a provided toth_key_t
+    toth_remove - Remove data. Optional, as sessions are timed out automatically
+    toth_lookup - Lookup 
+    toth_free - Free 
+
+    toth_config_init - Populate a config structure with defaults
+    toth_full - Returns true if the table is full and an insert would fail
+    toth_do_timeouts - Force timeout code to run
+
+Perform action on each row:
+
+    toth_foreach(t, <callback>, <user context>)
+
+Collect stats:
+
+    toth_stats_t bs;
+    toth_get_stats(ssns, &bs);
+ 
+Hashes must be provided with a callback to free data:
+
+    void free_cb(void *data_to_free) { ... }
+
+Future: the hash can be resized using toth_do_resize.
+
+NOTE: timeouts are intended to be the primary means to cleanup data. toth_remove
+will unlink and free a row, however complete garbage collection won't happen until
+timed out.
 
 # Other included implementations
 
@@ -72,8 +133,7 @@ timeouts are performed on coarse blocks, the performance impact is negligible.
 
 Used by https://github.com/ajkeeton/pack_stat for TCP session stats
 
-
-# Basic usage
+# BGH Basic usage
 
     bgh_new(...)
     bgh_insert(...)
@@ -84,10 +144,6 @@ Used by https://github.com/ajkeeton/pack_stat for TCP session stats
 Hashes must be provided with a callback to free data:
 
     void free_cb(void *data_to_free) { ... }
-
-# Sample
-
-    ./sample/pcap_stats <pcap>
 
 # BGH Configuration
 

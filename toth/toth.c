@@ -183,16 +183,6 @@ void toth_key_free(toth_t *tbl, toth_data_t *row) {
     row->key = NULL;
 }
 
-#if 0
-void toth_key_set(toth_data_t *row, toth_key_t *key) {
-    if(row->key) {
-        free(row->key);
-        active_keys--;
-    }
-    row->key = key;
-}
-#endif
-
 int key_eq(toth_key_t *k1, toth_key_t *k2) {
     if(k1->family == AF_INET) {
         return
