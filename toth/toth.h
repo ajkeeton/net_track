@@ -64,7 +64,8 @@ typedef struct _toth_ip_t {
 } toth_ips_t;
 
 typedef struct _toth_key_t {
-    toth_ips_t sip, dip;
+    toth_ips_t sip, 
+               dip;
 
     uint16_t sport,
              dport;
@@ -144,8 +145,11 @@ void toth_config_init(toth_config_t *config);
 // Free session tbl
 void toth_free(toth_t *tbl);
 
-// Lookup entry. Points to user data, if any. Increments reference count
+// Lookup entry. Points to user data, if any
 void *toth_lookup(toth_t *tbl, toth_key_t *key);
+
+// Lookup, but don't adjust timeouts
+void *toth_lookup_no_refresh(toth_t *tbl, toth_key_t *key);
 
 // Insert entry
 // Will allocate a new key interally and copy 'key' to it

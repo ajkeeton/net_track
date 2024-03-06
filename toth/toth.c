@@ -391,6 +391,15 @@ void *toth_lookup(toth_t *tbl, toth_key_t *key) {
     return row->user;
 }
 
+void *toth_lookup_no_refresh(toth_t *tbl, toth_key_t *key) {
+    toth_data_t *row = _lookup(tbl, key, false);
+
+    if(!row || !row->user)
+        return NULL;
+    
+    return row->user;
+}
+
 void toth_remove(toth_t *t, toth_key_t *key) {
     toth_data_t *row = _lookup(t, key, false);
     

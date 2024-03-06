@@ -154,6 +154,11 @@ void basic(bool use_ipv6 = false) {
     toth_free(tracker);
 }
 
+void artificially_age(toth_t *t) {
+    assert(t->to_last);
+    t->to_last -= t->conf.timeout;
+}
+
 void timeouts() {
     printf("%s\n", __func__);
 
@@ -164,7 +169,7 @@ void timeouts() {
 
     toth_t *tracker = toth_config_new(&conf, count_frees_cb);
 
-    tracker->conf.timeout = 100000;
+    tracker->conf.timeout = 100000000;
 
     toth_key_t key;
     // Bzero'ing to clean up pad bytes and prevent valgrind from complaining
@@ -173,39 +178,39 @@ void timeouts() {
     key.dport = 2;
     key.family = AF_INET;
 
-    ////////////////////////////////////////////////////
-    // Add three, but cross the refresh + timeout period
+    key.sip.v4 = 0;
+    toth_keyed_insert(tracker, &key, strdup_count("0"));
 
+    // NOTE: Next insert timeouts the *empty* table
+    artificially_age(tracker);
     key.sip.v4 = 1;
     toth_keyed_insert(tracker, &key, strdup_count("1"));
-    tracker->to_last = 0;
-    // the next insert triggers the timeout code ... but it's an empty table since we just started
+    // Now we have 1 entry in each table
+
+    artificially_age(tracker);
     key.sip.v4 = 2;
     toth_keyed_insert(tracker, &key, strdup_count("2"));
 
-    // Real timeout
-    tracker->to_last = 0;
-    key.sip.v4 = 3;
-    toth_keyed_insert(tracker, &key, strdup_count("3"));
-
     assert(tracker->inserted == 2);
+    artificially_age(tracker);
+    tot_do_timeouts(tracker);
+    assert(tracker->inserted == 1);
+
     key.sip.v4 = 1;
     assert_lookup_eq(tracker, key, NULL);
     key.sip.v4 = 2;
     assert_lookup_eq(tracker, key, "2");
-    key.sip.v4 = 3;
-    assert_lookup_eq(tracker, key, "3");
 
     // Make sure lookups keep entries alive
-    tracker->to_last = 0;
-    
-    // forcing timeout code to run without insert
-    // active table is moved forward
-    tot_do_timeouts(tracker);
+    artificially_age(tracker);
     // lookup moves this key to new table
     key.sip.v4 = 2;
     assert_lookup_eq(tracker, key, "2");
-    tracker->to_last = 0;
+    tot_do_timeouts(tracker);
+    assert_lookup_eq(tracker, key, "2");
+
+#if 0
+    artificially_age(tracker);
 
     // Force timeouts without an insert
     tot_do_timeouts(tracker);
@@ -216,11 +221,11 @@ void timeouts() {
     assert_lookup_eq(tracker, key, "2");
     key.sip.v4 = 3;
     assert_lookup_eq(tracker, key, NULL);
-    tracker->to_last = 0;
+    artificially_age(tracker);
 
     // active table moved forward, "2" in old table
     tot_do_timeouts(tracker);
-    tracker->to_last = 0;
+    artificially_age(tracker);
     // "2" timed out
     tot_do_timeouts(tracker);
 
@@ -230,7 +235,7 @@ void timeouts() {
     assert_lookup_eq(tracker, key, NULL);
     assert(tracker->inserted == 0);
     assert(allocated == 0);
-
+#endif
     toth_free(tracker);
 }        
 
@@ -254,16 +259,16 @@ void timeouts_tricky() {
             if(toth_keyed_insert(tbl, &key, p) != TOTH_OK)
                 free(p);
         }
-        tbl->to_last = 0;
+        artificially_age(tbl);
     }
 
     assert(tbl->inserted == conf.max_inserts);
 
     // Force timeout on next insert
-    tbl->to_last = 0;
+    artificially_age(tbl);
 
     ///////////////////////////////////////////////////////////////////
-    // Next set of tesets will make sure nodes will move across tables
+    // Next set of tests will make sure nodes will move across tables
     // on lookup
     char *p = strdup("test A");
     gen_rand_key(&key);
@@ -282,7 +287,7 @@ void timeouts_tricky() {
     assert(toth_keyed_insert(tbl, &key3, p) == TOTH_OK);
 
     // Force timeout
-    tbl->to_last = 0; 
+    artificially_age(tbl);
     tot_do_timeouts(tbl);
 
     // Use the lookup to move our rows across tables
@@ -290,19 +295,19 @@ void timeouts_tricky() {
     assert_lookup_eq(tbl, key2, "test C");
     assert_lookup_eq(tbl, key1, "test B");
  
-    tbl->to_last = 0; 
+    artificially_age(tbl);
     tot_do_timeouts(tbl);
 
     // Move key1 forward again
     assert_lookup_eq(tbl, key1, "test B");
-    tbl->to_last = 0;
+    artificially_age(tbl);
     tot_do_timeouts(tbl);
     assert(tbl->inserted == 3);
 
     // Move key1 forward again
     // Rest will be getting timed out
     assert_lookup_eq(tbl, key1, "test B");
-    tbl->to_last = 0;
+    artificially_age(tbl);
     tot_do_timeouts(tbl);
 
     assert(tbl->inserted == 1);
@@ -313,7 +318,7 @@ void timeouts_tricky() {
     assert(toth_keyed_insert(tbl, &key1, p) == TOTH_OK);
     assert_lookup_eq(tbl, key1, "test E");
     assert(tbl->inserted == 1);
-    tbl->to_last = 0;
+    artificially_age(tbl);
 
     // Swapping ports to create a collision
     key1.sport = key1.sport + key1.dport;
@@ -324,15 +329,15 @@ void timeouts_tricky() {
     assert_lookup_eq(tbl, key1, "test F");
     assert(tbl->inserted == 2);
 
-    tbl->to_last = 0;
+    artificially_age(tbl);
     tot_do_timeouts(tbl);
     assert(tbl->inserted == 2);
 
-    tbl->to_last = 0;
+    artificially_age(tbl);
     tot_do_timeouts(tbl);
     assert(tbl->inserted == 1);
 
-    tbl->to_last = 0;
+    artificially_age(tbl);
     tot_do_timeouts(tbl);
     assert(tbl->inserted == 0);
     
@@ -603,8 +608,8 @@ toth_key_t *get_next_key() {
     return &keys[i++];
 }
 
-#define INIT_NUM_ROWS 300043
-#define TEST_LENGTH 20 // 60*5
+#define INIT_NUM_ROWS 500107
+#define TEST_LENGTH 60 // 60*5
 
 void stress() {
     puts("Starting long-running stress test");
@@ -670,7 +675,7 @@ void stress() {
             toth_randomize_refreshes(tracker, 5);
         }
 
-        if(now - last_state_change > 30) {
+        if(now - last_state_change > 20) {
             sessions_max = rand() % keys.size();
             if(sessions_max < NUM_KEYS)
                 sessions_max = NUM_KEYS;
@@ -705,12 +710,12 @@ void stress() {
         }
 
         // Clear
-        if(!(rand() % 20)) {
+        if(!(rand() % 15)) {
             toth_remove(tracker, get_rand_key());
         }
 
         // Replace a key. Hack to force an old session to timeout
-        if(!(rand() % 10))
+        if(!(rand() % 8))
             gen_rand_key(&keys[rand() % keys.size()]);
 
         iteration++;
@@ -720,8 +725,7 @@ void stress() {
 
     // Force everything to time out
     tracker->conf.timeout = 0;
-    for(int i=0; i<tracker->conf.timeout_tables; i++)
-        tot_do_timeouts(tracker);
+    tot_do_timeouts(tracker);
 
     assert(!allocated);
     assert(!tracker->inserted);

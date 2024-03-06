@@ -303,16 +303,24 @@ void tot_copy(toth_t *dtbl, toth_t *ftbl) {
 // Purge oldest table if enough time has passed
 void tot_do_timeouts(toth_t *tbl) {
     uint64_t t = time_ns();
-
-    if((t - tbl->to_last) < tbl->conf.timeout) {
+    uint64_t d = t - tbl->to_last;
+    if(d < tbl->conf.timeout) {
         return;
     }
-
     tbl->to_last = t;
-    tbl->to_active = tbl->to_active+1 < tbl->conf.timeout_tables ? tbl->to_active+1 : 0;
 
-    DEBUG("Timing out %d with %d\n", tbl->to_active, tbl->tos[tbl->to_active]->inserted);
-    _to_clear_table(tbl, _tot_get_active(tbl));
+    // Handle the unintuitive case where multiple tables have timed out
+    uint64_t n = d / (tbl->conf.timeout + 1);
+    if(n > tbl->conf.timeout_tables)
+        n = tbl->conf.timeout_tables;
+
+    DEBUG("Timing out %d tables (%llu / %llu)\n", n, d, tbl->conf.timeout + 1);
+    for(int i=0; i < n; i++) {
+        tbl->to_active = tbl->to_active+1 < tbl->conf.timeout_tables ? tbl->to_active+1 : 0;
+
+        DEBUG("\ttable index %d with %d entries\n", tbl->to_active, tbl->tos[tbl->to_active]->inserted);
+        _to_clear_table(tbl, _tot_get_active(tbl));
+    }
 }
 
 void to_foreach(toth_to_tbl_t *tot, void (*cb)(toth_key_t *, void *, void *), void *ctx) {
